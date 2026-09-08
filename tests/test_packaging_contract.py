@@ -107,7 +107,9 @@ def test_workflow_is_manual_or_tagged_and_uses_official_intel_runner() -> None:
     assert "runs-on: macos-15-intel" in workflow
     assert 'python-version: "3.12"' in workflow
     assert "bash packaging/build_macos.sh" in workflow
-    assert "actions/upload-artifact@v4" in workflow
+    assert "actions/checkout@v5" in workflow
+    assert "actions/setup-python@v6" in workflow
+    assert "actions/upload-artifact@v6" in workflow
     assert "release/*.dmg.zip" in workflow
     assert "SHA256SUMS.txt" in workflow
     assert "APPLE_ID" not in workflow
