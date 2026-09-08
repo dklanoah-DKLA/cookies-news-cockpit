@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+.uv-cache/
+test-tmp-local/
+
+# Build and release outputs
+build/
+dist/
+release/
+artifacts/
+*.dmg
+*.dmg.zip
+SHA256SUMS.txt
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# IDE and operating-system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Local runtime data (production data belongs in ~/Library/Application Support)
+.local-data/
+logs/

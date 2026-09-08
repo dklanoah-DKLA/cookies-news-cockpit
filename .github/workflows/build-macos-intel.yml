@@ -1,0 +1,94 @@
+name: Build Intel macOS DMG
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（例如 0.1.0）"
+        required: true
+        default: "0.1.0"
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-intel-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-intel-dmg:
+    name: Test and package x86_64 app
+    runs-on: macos-15-intel
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12 x64
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: "x64"
+          cache: "pip"
+
+      - name: Resolve safe version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            raw_version="${INPUT_VERSION}"
+          else
+            raw_version="${REF_NAME#v}"
+          fi
+          safe_version="$(printf '%s' "${raw_version}" | tr -cd '0-9A-Za-z._-')"
+          if [[ -z "${safe_version}" || "${safe_version}" != "${raw_version}" ]]; then
+            echo "Invalid version: use only letters, digits, dots, underscores and hyphens" >&2
+            exit 1
+          fi
+          echo "APP_VERSION=${safe_version}" >> "${GITHUB_ENV}"
+
+      - name: Install build and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+
+      - name: Run automated tests
+        run: python -m pytest
+
+      - name: Build, ad-hoc sign and package
+        run: bash packaging/build_macos.sh
+
+      - name: Record package facts
+        run: |
+          app="dist/Cookies News Cockpit.app"
+          executable="${app}/Contents/MacOS/Cookies News Cockpit"
+          {
+            echo "## Cookies News Cockpit ${APP_VERSION}"
+            echo
+            echo "- Runner: \`$(uname -m)\` on \`$(sw_vers -productVersion)\`"
+            echo "- Executable: \`$(lipo -archs "${executable}")\`"
+            echo "- Minimum macOS: \`$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "${app}/Contents/Info.plist")\`"
+            echo "- Signature: ad-hoc integrity signature only"
+            echo "- Not Apple-notarized; first launch requires the documented manual approval"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          du -h release/*
+          cat release/SHA256SUMS.txt
+
+      - name: Upload DMG, ZIP fallback and checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cookies-News-Cockpit-${{ env.APP_VERSION }}-Intel
+          path: |
+            release/*.dmg
+            release/*.dmg.zip
+            release/SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30

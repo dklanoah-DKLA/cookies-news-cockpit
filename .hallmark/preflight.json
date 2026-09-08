@@ -1,0 +1,18 @@
+{
+  "scanned_at": "2026-09-08",
+  "design_md": null,
+  "font_stack": "none detected; introduced bundled Bricolage Grotesque 700 + IBM Plex Sans 400/600",
+  "palette": "none detected; introduced custom OKLCH tokens",
+  "motion": "motion-cut; no motion library",
+  "spacing": "none detected; introduced 4pt semantic scale",
+  "framework": "vanilla HTML, CSS, and JavaScript",
+  "preserved": [],
+  "introduced": [
+    "Workbench macrostructure",
+    "N13 inline command-search pill",
+    "Ft2 inline-rule footer",
+    "Tier A decorative cookie field",
+    "full interaction states",
+    "mobile-first responsive system"
+  ]
+}
