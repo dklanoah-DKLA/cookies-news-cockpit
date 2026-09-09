@@ -23,8 +23,8 @@ class DeepSeekKeyStore:
             import keyring
 
             return keyring.get_password(self.service, self.username)
-        except Exception:
-            return None
+        except Exception as exc:
+            raise KeyStoreError("系统钥匙串不可用，无法读取 API Key") from exc
 
     def set(self, api_key: str) -> None:
         try:

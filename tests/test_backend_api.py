@@ -69,7 +69,13 @@ def test_api_requires_session_token_and_bootstrap_contract(backend_home: Path) -
         "latest_report",
     }
     assert payload["product"]["name"] == "Cookies News Cockpit"
-    assert payload["deepseek"] == {"configured": False, "model": "deepseek-chat"}
+    assert payload["deepseek"] == {
+        "configured": False,
+        "status": "unconfigured",
+        "model": "deepseek-v4-flash",
+        "last_tested_at": None,
+        "error": None,
+    }
     assert any(source["id"] == "preset-chinanews-scroll" for source in payload["sources"])
     assert response.headers["referrer-policy"] == "no-referrer"
     assert response.headers["cache-control"] == "no-store"

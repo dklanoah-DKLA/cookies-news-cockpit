@@ -7,7 +7,8 @@ PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 APP_NAME="Cookies News Cockpit"
 APP_PATH="${PROJECT_ROOT}/dist/${APP_NAME}.app"
 EXECUTABLE_PATH="${APP_PATH}/Contents/MacOS/${APP_NAME}"
-APP_VERSION="${APP_VERSION:-0.1.0}"
+SOURCE_VERSION="$(python -c 'import runpy, sys; print(runpy.run_path(sys.argv[1])["__version__"])' "${PROJECT_ROOT}/src/cookies_news_cockpit/_version.py")"
+APP_VERSION="${APP_VERSION:-${SOURCE_VERSION}}"
 export APP_VERSION
 export MACOSX_DEPLOYMENT_TARGET="14.0"
 
@@ -18,6 +19,11 @@ fi
 
 if [[ "$(uname -m)" != "x86_64" ]]; then
   echo "error: expected an Intel x86_64 runner, got $(uname -m)" >&2
+  exit 1
+fi
+
+if [[ "${APP_VERSION}" != "${SOURCE_VERSION}" ]]; then
+  echo "error: requested version ${APP_VERSION} does not match source version ${SOURCE_VERSION}" >&2
   exit 1
 fi
 

@@ -1,7 +1,6 @@
 """Cookies News Cockpit: a local-first personal news dashboard."""
 
-__version__ = "0.1.0"
-
+from ._version import __version__ as __version__
 from .api import create_app
 
-__all__ = ["create_app"]
+__all__ = ["__version__", "create_app"]

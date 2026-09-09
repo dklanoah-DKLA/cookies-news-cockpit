@@ -12,7 +12,8 @@ def read(relative_path: str) -> str:
 
 
 def test_runtime_and_build_dependencies_are_declared() -> None:
-    project = tomllib.loads(read("pyproject.toml"))["project"]
+    configuration = tomllib.loads(read("pyproject.toml"))
+    project = configuration["project"]
     runtime_names = {
         re.split(r"[<>=!~\[]", item, maxsplit=1)[0].lower()
         for item in project["dependencies"]
@@ -23,6 +24,11 @@ def test_runtime_and_build_dependencies_are_declared() -> None:
     }
 
     assert project["requires-python"] == ">=3.12,<3.13"
+    assert project["dynamic"] == ["version"]
+    assert configuration["tool"]["setuptools"]["dynamic"]["version"] == {
+        "attr": "cookies_news_cockpit._version.__version__"
+    }
+    assert '__version__ = "1.1.0"' in read("src/cookies_news_cockpit/_version.py")
     assert {
         "beautifulsoup4",
         "fastapi",
@@ -45,6 +51,8 @@ def test_pyinstaller_bundle_contract_targets_intel_sonoma() -> None:
     assert 'bundle_identifier="com.cookies.newscockpit"' in spec
     assert '"LSMinimumSystemVersion": "14.0"' in spec
     assert 'APP_NAME = "Cookies News Cockpit"' in spec
+    assert '"cookies_news_cockpit" / "_version.py"' in spec
+    assert "APP_VERSION != SOURCE_VERSION" in spec
     assert 'icon=str(ICON_PATH)' in spec
     assert "collect_data_files" in spec
     assert "BUNDLE(" in spec
@@ -73,7 +81,9 @@ def test_dmg_script_emits_transfer_fallback_and_checksums() -> None:
 
     assert "hdiutil create" in script
     assert "-format UDZO" in script
-    assert "ditto -c -k --keepParent" in script
+    assert '/usr/bin/zip -j -X -9 "${ZIP_PATH}" "${DMG_PATH}"' in script
+    assert "/usr/bin/unzip -Z1" in script
+    assert "ZIP must contain exactly one root-level DMG" in script
     assert ".dmg.zip" not in script  # ZIP_PATH is derived from the complete DMG filename.
     assert "shasum -a 256" in script
     assert "hdiutil verify" in script
@@ -109,11 +119,48 @@ def test_workflow_is_manual_or_tagged_and_uses_official_intel_runner() -> None:
     assert "bash packaging/build_macos.sh" in workflow
     assert "actions/checkout@v5" in workflow
     assert "actions/setup-python@v6" in workflow
+    assert "actions/setup-node@v4" in workflow
     assert "actions/upload-artifact@v6" in workflow
+    assert "python -m ruff check src tests" in workflow
+    assert "node scripts/e2e_qa.cjs" in workflow
+    assert "node scripts/visual_qa.cjs" in workflow
+    assert "Smoke-test the packaged application" in workflow
+    assert '"${executable}" --port 38119 --no-browser' in workflow
+    assert "curl --fail --silent --show-error http://127.0.0.1:38119/" in workflow
+    assert 'gh release create "${GITHUB_REF_NAME}"' in workflow
+    assert "contents: write" in workflow
     assert "release/*.dmg.zip" in workflow
     assert "SHA256SUMS.txt" in workflow
     assert "APPLE_ID" not in workflow
     assert "NOTARY" not in workflow.upper()
+
+
+def test_tag_release_publish_is_idempotent() -> None:
+    workflow = read(".github/workflows/build-macos-intel.yml")
+
+    assert 'gh release view "${GITHUB_REF_NAME}"' in workflow
+    assert 'gh release upload "${GITHUB_REF_NAME}"' in workflow
+    assert "--clobber" in workflow
+    assert 'gh release edit "${GITHUB_REF_NAME}"' in workflow
+    assert "--draft=false" in workflow
+    assert workflow.index('gh release view "${GITHUB_REF_NAME}"') < workflow.index(
+        'gh release create "${GITHUB_REF_NAME}"'
+    )
+    assert workflow.index('gh release upload "${GITHUB_REF_NAME}"') < workflow.index(
+        'gh release edit "${GITHUB_REF_NAME}"'
+    )
+
+
+def test_readme_distinguishes_candidate_artifacts_from_web_published_releases() -> None:
+    readme = read("README.md")
+
+    assert "这个 Actions artifact **只是候选测试包**" in readme
+    assert "30 天后会过期" in readme
+    assert "**Releases** 页面，点 **Draft a new release**" in readme
+    assert "**Create new tag: v1.1.0 on publish**" in readme
+    assert "不要手动上传从 Actions 下载的外层 ZIP" in readme
+    assert "覆盖同名资产并更新标准标题和说明" in readme
+    assert "三个资产齐全" in readme
 
 
 def test_bundled_fonts_ship_with_their_license() -> None:

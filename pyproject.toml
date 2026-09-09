@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cookies-news-cockpit"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A private, local-first news cockpit for macOS."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -55,6 +55,9 @@ cookies-news-cockpit = "cookies_news_cockpit.__main__:main"
 [tool.setuptools]
 package-dir = { "" = "src" }
 include-package-data = true
+
+[tool.setuptools.dynamic]
+version = { attr = "cookies_news_cockpit._version.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]

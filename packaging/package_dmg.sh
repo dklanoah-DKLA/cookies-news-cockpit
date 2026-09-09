@@ -53,7 +53,15 @@ hdiutil create \
 
 # The ZIP does not materially shrink a compressed DMG. It is provided because
 # some chat clients handle a .zip attachment more reliably than a raw .dmg.
-ditto -c -k --keepParent "${DMG_PATH}" "${ZIP_PATH}"
+# -j and -X guarantee that unpacking yields exactly one DMG at the ZIP root,
+# without release/ or AppleDouble metadata directories.
+/usr/bin/zip -j -X -9 "${ZIP_PATH}" "${DMG_PATH}"
+ZIP_ENTRY_COUNT="$(/usr/bin/unzip -Z1 "${ZIP_PATH}" | wc -l | tr -d ' ')"
+ZIP_ENTRY_NAME="$(/usr/bin/unzip -Z1 "${ZIP_PATH}")"
+if [[ "${ZIP_ENTRY_COUNT}" != "1" || "${ZIP_ENTRY_NAME}" != "$(basename -- "${DMG_PATH}")" ]]; then
+  echo "error: ZIP must contain exactly one root-level DMG" >&2
+  exit 1
+fi
 
 (
   cd -- "${OUTPUT_DIR}"

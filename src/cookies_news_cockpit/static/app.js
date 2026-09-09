@@ -20,7 +20,7 @@
   };
 
   const ACTIVE_RUN_STATES = new Set(["queued", "running"]);
-  const FINAL_RUN_STATES = new Set(["complete", "degraded", "failed"]);
+  const FINAL_RUN_STATES = new Set(["complete", "degraded", "failed", "cancelled"]);
   const sessionToken = captureSessionToken();
 
   const state = {
@@ -29,13 +29,17 @@
     settings: {
       default_threshold: 60,
       default_article_limit: 20,
+      freshness_days: 7,
       refresh_minutes: 60,
       scheduler_enabled: true,
-      extract_full_text: true
+      extract_full_text: true,
+      semantic_fallback_enabled: true,
+      semantic_fallback_limit: 20
     },
-    deepseek: { configured: false, model: "deepseek-chat" },
+    deepseek: { configured: false, model: "deepseek-v4-flash", status: "unconfigured" },
     topics: [],
     sources: [],
+    sourcePresets: [],
     currentRun: null,
     latestReport: null,
     history: [],
@@ -47,7 +51,15 @@
     pollTimer: null,
     heartbeatTimer: null,
     commandIndex: 0,
-    commandItems: []
+    commandItems: [],
+    runStarting: false,
+    runCancelling: false,
+    favoritePending: new Set(),
+    topicSuggestion: null,
+    importPreview: null,
+    onboardingStep: 0,
+    onboardingPresented: false,
+    onboardingBusy: false
   };
 
   const refs = {};
@@ -70,18 +82,22 @@
       "offline-banner", "retry-bootstrap", "service-label", "metric-topics", "metric-sources",
       "metric-last-run", "metric-run-state", "topic-count", "topic-rail-list", "show-all-topics",
       "latest-summary", "latest-list", "run-progress", "run-progress-title", "run-progress-detail",
-      "progress-fill", "run-badge", "run-mode", "run-model", "run-cap", "run-dedupe", "run-retention",
+      "progress-fill", "run-funnel", "funnel-fetched", "funnel-fresh", "funnel-matched", "funnel-fulltext", "funnel-duplicates", "funnel-ai", "funnel-threshold", "funnel-kept", "cancel-run", "source-errors",
+      "run-badge", "run-mode", "run-analysis-mode", "run-model", "run-cap", "run-dedupe", "run-retention",
       "topic-sheet", "source-sheet", "deepseek-badge", "deepseek-action", "history-filter",
       "history-query", "history-topic", "history-favorite", "history-list", "history-load-more", "dock-status", "dock-note",
       "start-run", "search-dialog", "command-query", "command-results", "topic-dialog", "topic-form",
-      "topic-dialog-title", "topic-id", "topic-name", "topic-keywords", "topic-threshold", "topic-limit",
+      "topic-dialog-title", "topic-id", "topic-name", "topic-keywords", "topic-keyword-count", "topic-keyword-chips", "topic-excludes", "topic-exclude-count", "topic-exclude-chips",
+      "topic-threshold", "topic-limit", "suggest-topic", "topic-suggestion", "topic-suggestion-copy", "topic-suggestion-chips", "apply-topic-suggestion",
       "topic-threshold-default", "topic-limit-default", "topic-source-options", "topic-enabled", "source-dialog", "source-form", "source-dialog-title",
-      "source-id", "source-name", "source-url", "source-enabled", "source-validation",
+      "source-id", "source-name", "source-homepage", "source-url", "source-category", "source-language", "source-preset", "source-terms", "source-enabled", "source-validation",
       "validate-source-draft", "settings-dialog", "settings-form", "setting-scheduler", "setting-threshold",
-      "setting-article-limit", "setting-refresh", "setting-extract", "deepseek-dialog", "deepseek-form",
-      "key-status", "deepseek-model", "deepseek-key", "toggle-key", "delete-key", "calibration-dialog",
+      "setting-article-limit", "setting-freshness", "setting-refresh", "setting-extract", "setting-semantic", "setting-semantic-limit", "deepseek-dialog", "deepseek-form",
+      "key-status", "deepseek-model", "deepseek-key", "toggle-key", "delete-key", "test-key", "deepseek-test-result", "calibration-dialog",
       "calibration-body", "confirm-calibration", "toast-region", "open-search", "open-settings",
-      "add-topic-rail", "add-topic", "add-source", "open-deepseek", "export-report", "shutdown-app"
+      "add-topic-rail", "add-topic", "add-source", "open-deepseek", "export-report", "import-report", "import-file", "shutdown-app", "shutdown-state", "shutdown-copy",
+      "onboarding-dialog", "onboarding-step-label", "onboarding-title", "onboarding-copy", "skip-onboarding", "wizard-source-categories", "wizard-topic-name", "wizard-topic-keywords",
+      "wizard-deepseek-key", "wizard-key-result", "wizard-test-key", "wizard-back", "wizard-skip-step", "wizard-next", "import-dialog", "import-preview", "apply-import"
     ].forEach((id) => {
       refs[toCamel(id)] = document.getElementById(id);
     });
@@ -147,13 +163,27 @@
     return error.detail || error.message || "请求没有完成";
   }
 
+  function isCompatibilityError(error) {
+    if (![404, 405, 422].includes(Number(error?.status))) return false;
+    const detail = describeError(error).toLocaleLowerCase();
+    return error.status !== 422 || /extra|unexpected|unknown|not permitted|不允许|字段/.test(detail);
+  }
+
+  function normalizeDeepSeekStatus(value = state.deepseek) {
+    const status = value?.status || value?.deepseek_status;
+    if (["unconfigured", "saved_unverified", "connected", "error"].includes(status)) return status;
+    if (value?.error || value?.deepseek_error) return "error";
+    return value?.configured ? "saved_unverified" : "unconfigured";
+  }
+
   async function api(path, options = {}) {
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), options.timeout || 15000);
     const headers = new Headers(options.headers || {});
+    const binaryBody = options.body instanceof Blob || options.body instanceof ArrayBuffer || ArrayBuffer.isView(options.body);
     headers.set("Accept", "application/json");
     if (sessionToken) headers.set("X-Cockpit-Token", sessionToken);
-    if (options.body !== undefined && !(options.body instanceof FormData)) {
+    if (options.body !== undefined && !(options.body instanceof FormData) && !binaryBody) {
       headers.set("Content-Type", "application/json");
     }
 
@@ -163,7 +193,7 @@
         headers,
         body: options.body === undefined
           ? undefined
-          : options.body instanceof FormData
+          : options.body instanceof FormData || binaryBody
             ? options.body
             : JSON.stringify(options.body),
         signal: controller.signal,
@@ -189,6 +219,15 @@
     }
   }
 
+  async function apiWithLegacyBody(path, options, legacyBody) {
+    try {
+      return await api(path, options);
+    } catch (error) {
+      if (!isCompatibilityError(error) || legacyBody === undefined) throw error;
+      return api(path, { ...options, body: legacyBody });
+    }
+  }
+
   function setConnection(online) {
     state.online = online;
     document.body.dataset.connection = online ? "online" : "offline";
@@ -207,7 +246,7 @@
     if (!button) return;
     if (value) button.dataset.state = value;
     else delete button.dataset.state;
-    button.disabled = value === "loading";
+    if (value === "loading") button.disabled = true;
     if (label) {
       const target = button.querySelector(".button__label") || button;
       target.textContent = label;
@@ -217,19 +256,28 @@
   async function runButtonTask(button, task, labels = {}) {
     const labelTarget = button.querySelector(".button__label");
     const original = labelTarget?.textContent || button.textContent;
+    const taskSequence = (button._taskSequence || 0) + 1;
+    button._taskSequence = taskSequence;
     setButtonState(button, "loading", labels.loading || "处理中");
     try {
       const result = await task();
       setButtonState(button, "success", labels.success || "已完成");
-      window.setTimeout(() => setButtonState(button, null, original), 900);
+      window.setTimeout(() => {
+        if (button._taskSequence === taskSequence && button.dataset.state === "success") setButtonState(button, null, original);
+      }, 900);
       return result;
     } catch (error) {
       setButtonState(button, "error", labels.error || "请重试");
+      if (error && typeof error === "object") error.cockpitNotified = true;
       notify(describeError(error), "error");
-      window.setTimeout(() => setButtonState(button, null, original), 1400);
+      window.setTimeout(() => {
+        if (button._taskSequence === taskSequence && button.dataset.state === "error") setButtonState(button, null, original);
+      }, 1400);
       throw error;
     } finally {
-      window.setTimeout(() => { button.disabled = false; }, 900);
+      window.setTimeout(() => {
+        if (button._taskSequence === taskSequence && button.dataset.state !== "loading") button.disabled = Boolean(labels.disabledAfter);
+      }, 900);
     }
   }
 
@@ -298,7 +346,14 @@
       const payload = await api("/api/bootstrap");
       state.product = payload.product || {};
       state.settings = { ...state.settings, ...(payload.settings || {}) };
-      state.deepseek = { ...state.deepseek, ...(payload.deepseek || {}) };
+      const deepseekPayload = payload.deepseek || {};
+      const mergedDeepSeek = { ...state.deepseek, ...deepseekPayload };
+      if (!deepseekPayload.status && payload.settings?.deepseek_status) mergedDeepSeek.status = payload.settings.deepseek_status;
+      state.deepseek = {
+        ...mergedDeepSeek,
+        status: normalizeDeepSeekStatus(mergedDeepSeek)
+      };
+      state.sourcePresets = Array.isArray(payload.source_presets || payload.presets) ? (payload.source_presets || payload.presets) : [];
       state.topics = Array.isArray(payload.topics) ? payload.topics : [];
       state.sources = Array.isArray(payload.sources) ? payload.sources : [];
       state.currentRun = payload.current_run || null;
@@ -310,6 +365,7 @@
       renderAll();
       await loadHistory({ quiet: true });
       manageRunPolling();
+      maybeOpenOnboarding(payload);
       return payload;
     } catch (error) {
       setConnection(false);
@@ -351,7 +407,8 @@
       running: "抓取中",
       complete: "已完成",
       degraded: "部分完成",
-      failed: "运行失败"
+      failed: "运行失败",
+      cancelled: "已取消"
     })[status] || "待机";
   }
 
@@ -373,9 +430,13 @@
             updateReportFilterButtons();
             renderTopicRail();
             renderLatest();
+            renderRunLane();
           }
         });
-        if (!topic.enabled) button.dataset.disabledTopic = "true";
+        if (!topic.enabled) {
+          button.dataset.disabledTopic = "true";
+          button.title = "此主题已停用，仅可查看历史，不能单独运行";
+        }
         refs.topicRailList.append(button);
       });
     }
@@ -388,6 +449,7 @@
     const report = state.latestReport;
     const articles = activeArticles();
     refs.latestList.replaceChildren();
+    renderSourceErrors(report);
 
     if (report?.run) {
       const sourceErrors = Array.isArray(report.source_errors) ? report.source_errors.length : 0;
@@ -401,9 +463,26 @@
 
     if (!articles.length) {
       const filtered = Boolean(state.activeTopicId || state.reportFilter === "favorite");
+      const outcome = report?.run?.outcome || state.currentRun?.outcome;
+      const duplicateOnly = Number(report?.run?.duplicates_skipped || state.currentRun?.duplicates_skipped || 0) > 0;
+      const outcomeMessages = {
+        cancelled: ["任务已取消", "已保留上一份有效报告；可以随时重新运行。"],
+        all_sources_failed: ["来源暂时都无法读取", "查看来源错误，修复地址或稍后重试；上一份有效报告未被覆盖。"],
+        no_fresh_articles: ["所选时效内没有可用新闻", "可以检查来源日期，或在设置里调整新闻时效。"],
+        no_keyword_match: ["近期新闻未命中主题", "可以扩展关键词、检查排除词，或启用语义兜底。"],
+        no_match: ["本次没有新闻达到门槛", "可以降低入选分数、扩展关键词，或检查排除词。"],
+        no_matches: ["本次没有新闻达到门槛", "可以降低入选分数、扩展关键词，或检查排除词。"],
+        below_threshold: ["候选新闻都低于门槛", "可以降低入选分数，或继续保持严格筛选。"],
+        no_new_after_dedup: ["近 7 天没有新增新闻", "重复审核已完成，上一份有效报告继续保留。"]
+      };
+      const message = filtered
+        ? ["这个视图里还没有内容", "换一个主题、取消收藏筛选，或查看全部新闻。"]
+        : outcomeMessages[outcome]
+          || (duplicateOnly ? outcomeMessages.no_new_after_dedup : ["第一份报告在等你", "先添加新闻来源和主题，然后开始抓取。"]);
+      const [emptyTitle, emptyCopy] = message;
       refs.latestList.append(emptyState(
-        filtered ? "这个视图里还没有内容" : "第一份报告在等你",
-        filtered ? "换一个主题或查看全部新闻。" : "先添加新闻来源和主题，然后开始抓取。",
+        emptyTitle,
+        emptyCopy,
         filtered ? "查看全部" : state.topics.length ? "开始抓取" : "新建主题",
         () => {
           if (filtered) {
@@ -425,6 +504,21 @@
     articles.forEach((article) => refs.latestList.append(articleRow(article, "story")));
   }
 
+  function renderSourceErrors(report) {
+    const errors = Array.isArray(report?.source_errors) ? report.source_errors : [];
+    refs.sourceErrors.replaceChildren();
+    refs.sourceErrors.hidden = !errors.length;
+    if (!errors.length) return;
+    refs.sourceErrors.append(node("strong", { text: `${errors.length} 个来源需要检查` }));
+    const list = node("ul");
+    errors.forEach((error) => {
+      const item = typeof error === "string" ? { error } : error;
+      const source = state.sources.find((candidate) => candidate.id === item.source_id);
+      list.append(node("li", { text: `${source?.name || item.source_name || "未知来源"}：${item.error || item.message || "读取失败"}` }));
+    });
+    refs.sourceErrors.append(list);
+  }
+
   function articleRow(article, variant = "story") {
     const body = node("div", { className: `${variant}-row__body` });
     const meta = node("div", { className: `${variant}-row__meta` });
@@ -432,6 +526,14 @@
     if (article.source_name) meta.append(node("span", { text: article.source_name }));
     if (article.published_at) meta.append(node("span", { text: dateLabel(article.published_at) }));
     if (Number.isFinite(Number(article.score))) meta.append(node("span", { className: "score-label", text: `${article.score} 分` }));
+    const analysisMode = article.analysis_mode || article.mode || (article.model ? "ai" : "rules");
+    const usedAi = String(analysisMode).startsWith("ai") || analysisMode === "deepseek";
+    const modeText = usedAi
+      ? `AI${String(analysisMode).includes("semantic") ? " 语义" : ""}${String(analysisMode).includes("cache") ? " · 缓存" : article.model ? ` · ${article.model}` : ""}`
+      : String(analysisMode).includes("fallback") || String(analysisMode).includes("breaker")
+        ? "规则降级"
+        : "规则筛选";
+    meta.append(node("span", { className: "mode-label", text: modeText, "data-mode": usedAi ? "ai" : "rules" }));
     body.append(meta);
 
     const heading = node("h3");
@@ -440,6 +542,9 @@
     if (article.excerpt) body.append(node("p", { className: `${variant}-row__excerpt`, text: article.excerpt }));
     const analysis = article.analysis || article.summary;
     if (analysis) body.append(node("p", { className: "analysis-note", text: analysis }));
+    if (Array.isArray(article.matched_keywords) && article.matched_keywords.length) {
+      body.append(node("p", { className: "match-note", text: `命中：${article.matched_keywords.join(" · ")}${Array.isArray(article.matched_fields) && article.matched_fields.length ? `（${article.matched_fields.join("、")}）` : ""}` }));
+    }
 
     const favorite = node("button", {
       className: "favorite-button",
@@ -447,7 +552,7 @@
       title: article.favorite ? "取消收藏" : "收藏",
       "aria-label": article.favorite ? `取消收藏：${article.title}` : `收藏：${article.title}`,
       "aria-pressed": String(Boolean(article.favorite)),
-      disabled: !article.id,
+      disabled: !article.id || state.favoritePending.has(article.id),
       onclick: () => toggleFavorite(article, favorite)
     }, icon("heart"));
     return node("article", { className: `${variant}-row` }, [body, favorite]);
@@ -469,26 +574,62 @@
     const status = run?.status;
     refs.runBadge.textContent = runStatusLabel(status);
     refs.runBadge.dataset.state = ACTIVE_RUN_STATES.has(status) ? "running" : status === "complete" ? "success" : ["degraded", "failed"].includes(status) ? "error" : "idle";
-    refs.runMode.textContent = state.settings.scheduler_enabled ? `自动 · ${state.settings.refresh_minutes} 分钟` : "仅手动";
-    refs.runModel.textContent = state.deepseek.model || "deepseek-chat";
-    refs.runCap.textContent = "500 次分析";
+    const trigger = run?.trigger || (["scheduler", "manual"].includes(run?.mode) ? run.mode : null);
+    refs.runMode.textContent = trigger === "scheduler" ? "自动任务" : trigger === "manual" ? "手动" : state.settings.scheduler_enabled ? `自动 · ${state.settings.refresh_minutes} 分钟` : "仅手动";
+    const reportedAnalysisMode = run?.analysis_mode || (!["scheduler", "manual"].includes(run?.mode) ? run?.mode : null);
+    const aiRequests = Number(run?.ai_requests ?? run?.analysis_count);
+    const aiSuccess = Number(run?.ai_success);
+    const aiFailure = Number(run?.ai_failure);
+    const explicitMode = String(reportedAnalysisMode || "");
+    refs.runAnalysisMode.textContent = explicitMode === "mixed" || (aiSuccess > 0 && aiFailure > 0)
+      ? "AI + 规则"
+      : explicitMode.includes("fallback") || (aiFailure > 0 && !(aiSuccess > 0))
+        ? "规则降级"
+        : explicitMode.startsWith("ai") || aiSuccess > 0 || aiRequests > 0
+          ? "AI 分析"
+          : state.deepseek.status === "connected" && ACTIVE_RUN_STATES.has(status)
+            ? "AI 已就绪"
+            : "规则筛选";
+    refs.runModel.textContent = state.deepseek.model || "deepseek-v4-flash";
+    const analyses = Number(run?.analyses ?? run?.analysis_count);
+    refs.runCap.textContent = Number.isFinite(analyses) ? `${analyses} / 500 次分析` : "500 次分析";
     const duplicates = Number(run?.duplicates_skipped || 0);
     refs.runDedupe.textContent = duplicates ? `近 7 天 · 拦截 ${duplicates} 条` : "默认 · 近 7 天";
     refs.runRetention.textContent = "30 天";
     refs.metricRunState.textContent = runStatusLabel(status);
     document.body.dataset.runState = ACTIVE_RUN_STATES.has(status) ? "running" : "idle";
 
-    const active = ACTIVE_RUN_STATES.has(status);
-    setButtonState(refs.startRun, active ? "loading" : null, active ? "正在抓取" : "开始抓取");
-    refs.startRun.disabled = active || !state.online;
-    refs.runProgress.hidden = !active;
+    const active = ACTIVE_RUN_STATES.has(status) || state.runStarting;
+    const selectedTopic = state.activeTopicId ? state.topics.find((topic) => topic.id === state.activeTopicId) : null;
+    const selectedTopicDisabled = Boolean(selectedTopic && !selectedTopic.enabled);
+    setButtonState(refs.startRun, active ? "loading" : null, state.runStarting ? "正在启动" : active ? "正在抓取" : selectedTopicDisabled ? "主题已停用" : "开始抓取");
+    refs.startRun.disabled = active || !state.online || selectedTopicDisabled;
+    refs.runProgress.hidden = !(active || run);
+    refs.runProgress.dataset.state = active ? "running" : "finished";
+    refs.cancelRun.hidden = !ACTIVE_RUN_STATES.has(status);
+    refs.cancelRun.disabled = state.runCancelling;
+    refs.importReport.disabled = active;
+    if (refs.importDialog.open) refs.applyImport.disabled = active || !(state.importPreview?.import_id || state.importPreview?.id);
+    renderRunFunnel(run);
+    if (active || run) {
+      const progress = runProgress(run, status);
+      refs.progressFill.parentElement.dataset.progress = String(Math.round(progress / 10) * 10);
+      refs.progressFill.parentElement.dataset.phase = run?.phase || status || "queued";
+      refs.progressFill.parentElement.setAttribute("aria-valuenow", String(progress));
+      refs.progressFill.parentElement.setAttribute("aria-valuetext", `${phaseLabel(run?.phase, status)}，${progress}%`);
+      if (!active) {
+        refs.runProgressTitle.textContent = status === "failed" ? "本次运行失败" : status === "degraded" ? "本次部分完成" : status === "cancelled" ? "本次任务已取消" : "本次处理完成";
+        refs.runProgressDetail.textContent = run?.warning || run?.error || ({
+          no_fresh_articles: "所选时效内没有可用新闻。",
+          no_keyword_match: "近期新闻未命中主题关键词。",
+          no_new_after_dedup: "重复审核完成，近 7 天内没有新增新闻。",
+          below_threshold: "候选新闻均低于当前入选门槛。"
+        })[run?.outcome] || `最终入选 ${run?.funnel?.selected ?? run?.article_count ?? 0} 条新闻。`;
+      }
+    }
     if (active) {
-      refs.runProgressTitle.textContent = status === "queued" ? "任务已进入队列" : "正在抓取并分析";
+      refs.runProgressTitle.textContent = state.runCancelling ? "正在取消任务" : phaseLabel(run?.phase, status);
       refs.runProgressDetail.textContent = run?.warning || "来源失败不会阻断其他来源。";
-      const progress = status === "queued" ? 0.22 : 0.62;
-      refs.progressFill.parentElement.dataset.phase = status === "queued" ? "queued" : "running";
-      refs.progressFill.parentElement.setAttribute("aria-valuenow", String(Math.round(progress * 100)));
-      refs.progressFill.parentElement.setAttribute("aria-valuetext", status === "queued" ? "排队中" : "运行中");
       refs.dockStatus.textContent = status === "queued" ? "等待运行" : "正在抓取";
       refs.dockNote.textContent = "可以继续浏览；完成后这里会自动刷新。";
     } else if (status === "failed") {
@@ -497,6 +638,9 @@
     } else if (status === "degraded") {
       refs.dockStatus.textContent = "上次部分完成";
       refs.dockNote.textContent = run.warning || "部分来源未成功，已保留可用结果。";
+    } else if (status === "cancelled") {
+      refs.dockStatus.textContent = "上次任务已取消";
+      refs.dockNote.textContent = "旧报告已保留，可以重新运行。";
     } else if (status === "complete" && Number(run?.article_count || 0) === 0 && duplicates > 0) {
       refs.dockStatus.textContent = "重复审核完成";
       refs.dockNote.textContent = `近 7 天内无新增；已拦截 ${duplicates} 条重复新闻。`;
@@ -504,6 +648,48 @@
       refs.dockStatus.textContent = state.online ? "准备就绪" : "等待服务";
       refs.dockNote.textContent = "选择好主题后，一键抓取并分析。";
     }
+  }
+
+  function phaseLabel(phase, status) {
+    return ({
+      queued: "任务已进入队列",
+      fetching: "正在抓取来源",
+      filtering: "正在筛选时效与关键词",
+      deduplicating: "正在审核重复新闻",
+      matching: "正在匹配关键词",
+      analyzing: "正在进行 AI 审核",
+      saving: "正在保存报告",
+      persisting: "正在安全写入报告",
+      finished: "报告已完成",
+      complete: "报告已完成",
+      cancelled: "任务已取消"
+    })[phase] || (status === "queued" ? "任务已进入队列" : "正在抓取并分析");
+  }
+
+  function runProgress(run, status) {
+    const explicit = Number(run?.progress_percent ?? run?.progress);
+    if (Number.isFinite(explicit)) return Math.max(0, Math.min(100, explicit <= 1 ? Math.round(explicit * 100) : Math.round(explicit)));
+    if (FINAL_RUN_STATES.has(status)) return 100;
+    return ({ queued: 8, fetching: 24, filtering: 52, deduplicating: 46, matching: 61, analyzing: 78, saving: 92, persisting: 94, finished: 100, complete: 100, cancelled: 100 })[run?.phase || status] || 16;
+  }
+
+  function renderRunFunnel(run) {
+    const funnel = run?.funnel || {};
+    const value = (...keys) => {
+      for (const key of keys) {
+        const candidate = funnel[key] ?? run?.[key];
+        if (Number.isFinite(Number(candidate))) return String(Number(candidate));
+      }
+      return "—";
+    };
+    refs.funnelFetched.textContent = value("feed_items", "fetched", "fetched_count", "candidate_count");
+    refs.funnelFresh.textContent = value("fresh", "fresh_count");
+    refs.funnelMatched.textContent = value("keyword_hits", "matched", "keyword_matched", "matched_count");
+    refs.funnelFulltext.textContent = value("fulltext_fetches", "fulltext_count");
+    refs.funnelDuplicates.textContent = value("duplicates_skipped", "duplicate_count");
+    refs.funnelAi.textContent = value("ai_requests", "ai_reviewed", "analysis_count");
+    refs.funnelThreshold.textContent = value("threshold_rejected", "below_threshold");
+    refs.funnelKept.textContent = value("selected", "kept", "article_count", "stored_count");
   }
 
   function renderTopicSheet() {
@@ -532,7 +718,10 @@
       });
 
       const title = node("div", { className: "data-row__title" }, [toggle, node("span", { text: topic.name })]);
-      const keywords = node("div", { className: "data-row__keywords", text: topic.keywords?.length ? topic.keywords.join(" · ") : "未设置关键词" });
+      const keywordText = topic.keywords?.length ? topic.keywords.join(" · ") : "未设置关键词";
+      const exclusions = topic.exclusion_keywords || topic.exclude_keywords || [];
+      const keywords = node("div", { className: "data-row__keywords" }, [node("span", { text: keywordText })]);
+      if (exclusions.length) keywords.append(node("small", { text: `排除：${exclusions.join(" · ")}` }));
       const threshold = node("div", { text: `${effectiveThreshold(topic)} 分` });
       const limit = node("div", { text: `${effectiveLimit(topic)} 条` });
       const actions = node("div", { className: "row-actions" }, [
@@ -568,11 +757,16 @@
           } catch (error) { notify(describeError(error), "error"); }
         }
       });
-      const title = node("div", { className: "data-row__title" }, [toggle, node("span", { text: source.name })]);
-      const url = node("div", { className: "data-row__url" }, externalLink(source.url, source.url || "—"));
-      const type = node("div", {}, node("span", { className: "type-label", text: "RSS / Atom" }));
+      const presetNote = source.preset_id ? ` · 内置 v${source.preset_version || 1}${source.user_modified ? " · 已调整" : ""}` : "";
+      const titleCopy = node("span", {}, [node("span", { text: source.name }), node("small", { text: `${sourceCategoryLabel(source.category)} · ${source.language || "zh"}${presetNote}` })]);
+      const title = node("div", { className: "data-row__title" }, [toggle, titleCopy]);
+      const url = node("div", { className: "data-row__url" }, [externalLink(source.url, source.url || "—")]);
+      if (source.homepage) url.append(externalLink(source.homepage, "网站首页", "source-home-link"));
+      if (source.terms) url.append(externalLink(source.terms, "使用条款", "source-home-link"));
+      const type = node("div", {}, node("span", { className: "type-label", text: source.preset_id ? "预置 RSS" : "RSS / Atom" }));
       const health = sourceHealth(source);
-      const badge = node("span", { className: "state-badge", text: health.label, "data-state": health.state, title: source.last_error || "" });
+      const badge = node("div", { className: "source-health" }, node("span", { className: "state-badge", text: health.label, "data-state": health.state }));
+      if (source.last_error) badge.append(node("small", { className: "source-error", text: source.last_error }));
       const actions = node("div", { className: "row-actions" }, [
         rowAction("refresh", "验证", (button) => validateSource(source, button)),
         rowAction("edit", "编辑", () => openSourceDialog(source)),
@@ -588,24 +782,35 @@
     return { label: "未验证", state: "idle" };
   }
 
+  function sourceCategoryLabel(category) {
+    return ({ general: "综合", world: "国际", business: "商业", technology: "科技", science: "科学", policy: "政策", industry: "行业", custom: "其他" })[category] || category || "综合";
+  }
+
   function rowAction(iconName, label, handler, danger = false) {
     return node("button", {
       className: `row-action${danger ? " row-action--danger" : ""}`,
       type: "button",
       onclick: (event) => handler(event.currentTarget)
-    }, [icon(iconName), node("span", { text: label })]);
+    }, [icon(iconName), node("span", { className: "button__label", text: label })]);
   }
 
   function renderDeepSeek() {
     const configured = Boolean(state.deepseek.configured);
-    refs.deepseekBadge.textContent = configured ? "已配置" : "未配置";
-    refs.deepseekBadge.dataset.state = configured ? "success" : "error";
+    const status = normalizeDeepSeekStatus(state.deepseek);
+    const presentation = {
+      unconfigured: { label: "未配置", state: "idle", copy: "尚未配置密钥；抓取仍可运行，但只做规则初筛。" },
+      saved_unverified: { label: "待测试", state: "running", copy: "密钥已保存在 macOS 钥匙串，建议测试连接。" },
+      connected: { label: "连接正常", state: "success", copy: "DeepSeek 连接已验证；密钥保存在 macOS 钥匙串。" },
+      error: { label: "连接异常", state: "error", copy: state.deepseek.error || state.deepseek.last_error || "上次测试失败；请检查密钥或网络。" }
+    }[status];
+    refs.deepseekBadge.textContent = presentation.label;
+    refs.deepseekBadge.dataset.state = presentation.state;
     refs.deepseekAction.querySelector(".button__label").textContent = configured ? "管理密钥" : "配置密钥";
-    refs.keyStatus.dataset.state = configured ? "success" : "error";
+    refs.keyStatus.dataset.state = presentation.state;
     refs.keyStatus.replaceChildren();
-    const dot = node("span", { className: `status-dot status-dot--${configured ? "success" : "error"}`, "aria-hidden": "true" });
-    refs.keyStatus.append(dot, node("span", { text: configured ? "密钥已安全保存在 macOS 钥匙串。" : "尚未配置密钥；抓取仍可运行，但只做关键词初筛。" }));
-    refs.deepseekModel.value = state.deepseek.model || "deepseek-chat";
+    const dot = node("span", { className: `status-dot status-dot--${presentation.state}`, "aria-hidden": "true" });
+    refs.keyStatus.append(dot, node("span", { text: presentation.copy }));
+    refs.deepseekModel.value = state.deepseek.model || "deepseek-v4-flash";
     refs.deleteKey.disabled = !configured;
   }
 
@@ -647,7 +852,13 @@
     refs.historyList.replaceChildren();
     refs.historyLoadMore.hidden = state.historyNextOffset === null;
     if (!state.history.length) {
-      refs.historyList.append(emptyState("没有找到历史内容", "完成一次抓取后，报告与收藏会出现在这里。", null, null));
+      const filtered = Boolean(refs.historyQuery.value.trim() || refs.historyTopic.value || refs.historyFavorite.checked);
+      refs.historyList.append(emptyState(
+        filtered ? "没有符合筛选的历史内容" : "还没有历史内容",
+        filtered ? "尝试清空关键词、更换主题或取消“只看收藏”。" : "完成一次抓取后，报告与收藏会出现在这里。",
+        null,
+        null
+      ));
       return;
     }
     state.history.forEach((article) => refs.historyList.append(articleRow(article, "history")));
@@ -662,26 +873,34 @@
       return;
     }
     state.sources.forEach((source) => {
-      const input = node("input", { type: "checkbox", value: source.id, checked: chosen.has(source.id) });
-      refs.topicSourceOptions.append(node("label", { className: "check-option" }, [input, node("span", { text: source.name })]));
+      const input = node("input", { type: "checkbox", value: source.id, checked: source.enabled && chosen.has(source.id), disabled: !source.enabled });
+      refs.topicSourceOptions.append(node("label", { className: `check-option${source.enabled ? "" : " is-disabled"}` }, [input, node("span", { text: source.enabled ? source.name : `${source.name}（已停用）` })]));
     });
   }
 
   function checkedSourceIds() {
     if (!refs.topicSourceOptions) return [];
-    return [...refs.topicSourceOptions.querySelectorAll('input[type="checkbox"]:checked')].map((input) => input.value);
+    return [...refs.topicSourceOptions.querySelectorAll('input[type="checkbox"]:checked:not(:disabled)')].map((input) => input.value);
   }
 
   function populateSettingsForm() {
     refs.settingScheduler.checked = Boolean(state.settings.scheduler_enabled);
     refs.settingThreshold.value = state.settings.default_threshold ?? 60;
     refs.settingArticleLimit.value = state.settings.default_article_limit ?? 20;
+    refs.settingFreshness.value = state.settings.freshness_days == null ? "" : String(state.settings.freshness_days);
     const refresh = String(state.settings.refresh_minutes ?? 60);
     if (![...refs.settingRefresh.options].some((option) => option.value === refresh)) {
       refs.settingRefresh.append(node("option", { value: refresh, text: `每 ${refresh} 分钟` }));
     }
     refs.settingRefresh.value = refresh;
     refs.settingExtract.checked = Boolean(state.settings.extract_full_text);
+    refs.settingSemantic.checked = state.settings.semantic_fallback_enabled !== false;
+    refs.settingSemanticLimit.value = state.settings.semantic_fallback_limit ?? 20;
+    syncSemanticControls();
+  }
+
+  function syncSemanticControls() {
+    refs.settingSemanticLimit.disabled = !refs.settingSemantic.checked;
   }
 
   function openDialog(dialog, focusTarget = null) {
@@ -700,6 +919,7 @@
     refs.topicDialogTitle.textContent = topic ? "编辑主题" : "新建主题";
     refs.topicName.value = topic?.name || "";
     refs.topicKeywords.value = topic?.keywords?.join(", ") || "";
+    refs.topicExcludes.value = (topic?.exclusion_keywords || topic?.exclude_keywords || []).join(", ");
     refs.topicThreshold.value = topic?.threshold ?? state.settings.default_threshold ?? 60;
     refs.topicLimit.value = topic?.article_limit ?? state.settings.default_article_limit ?? 20;
     refs.topicThresholdDefault.checked = topic ? topic.threshold === null : true;
@@ -707,6 +927,9 @@
     syncTopicDefaultControls();
     refs.topicEnabled.checked = topic ? Boolean(topic.enabled) : true;
     renderTopicSourceOptions(topic?.source_ids || []);
+    state.topicSuggestion = null;
+    refs.topicSuggestion.hidden = true;
+    renderKeywordDrafts();
     openDialog(refs.topicDialog, refs.topicName);
   }
 
@@ -714,9 +937,33 @@
     event.preventDefault();
     if (!refs.topicForm.reportValidity()) return;
     const id = refs.topicId.value;
+    const name = refs.topicName.value.trim();
+    if (!name) {
+      notify("请填写主题名称", "error");
+      refs.topicName.focus();
+      return;
+    }
+    const keywords = splitKeywords(refs.topicKeywords.value);
+    if (!keywords.length) {
+      notify("请至少填写一个包含关键词", "error");
+      refs.topicKeywords.focus();
+      return;
+    }
+    if (keywords.length > 40) {
+      notify("每个主题最多 40 个包含关键词", "error");
+      refs.topicKeywords.focus();
+      return;
+    }
+    const exclusionKeywords = splitKeywords(refs.topicExcludes.value);
+    if (exclusionKeywords.length > 40) {
+      notify("每个主题最多 40 个排除词", "error");
+      refs.topicExcludes.focus();
+      return;
+    }
     const payload = {
-      name: refs.topicName.value.trim(),
-      keywords: splitKeywords(refs.topicKeywords.value),
+      name,
+      keywords,
+      exclusion_keywords: exclusionKeywords,
       threshold: refs.topicThresholdDefault.checked ? null : Number(refs.topicThreshold.value),
       article_limit: refs.topicLimitDefault.checked ? null : Number(refs.topicLimit.value),
       source_ids: checkedSourceIds(),
@@ -724,7 +971,9 @@
     };
     const submit = refs.topicForm.querySelector('[type="submit"]');
     try {
-      await runButtonTask(submit, () => api(id ? `/api/topics/${encodeURIComponent(id)}` : "/api/topics", { method: id ? "PUT" : "POST", body: payload }), {
+      const legacyPayload = { ...payload };
+      delete legacyPayload.exclusion_keywords;
+      await runButtonTask(submit, () => apiWithLegacyBody(id ? `/api/topics/${encodeURIComponent(id)}` : "/api/topics", { method: id ? "PUT" : "POST", body: payload }, legacyPayload), {
         loading: "保存中", success: "已保存"
       });
       closeDialog(refs.topicDialog);
@@ -734,12 +983,82 @@
 
   function splitKeywords(value) {
     const seen = new Set();
-    return value.split(/[，,\n]/).map((item) => item.trim()).filter((item) => {
+    return value.split(/[，,、;；\r\n]/).map((item) => item.trim()).filter((item) => {
       const key = item.toLocaleLowerCase();
       if (!item || seen.has(key)) return false;
       seen.add(key);
       return true;
     });
+  }
+
+  function renderKeywordDrafts() {
+    renderKeywordList(refs.topicKeywords, refs.topicKeywordChips, refs.topicKeywordCount);
+    renderKeywordList(refs.topicExcludes, refs.topicExcludeChips, refs.topicExcludeCount);
+  }
+
+  function renderKeywordList(input, container, counter) {
+    const values = splitKeywords(input.value);
+    counter.textContent = `${values.length} / 40`;
+    counter.dataset.state = values.length > 40 ? "error" : "ok";
+    container.replaceChildren(...values.slice(0, 40).map((value) => node("span", { className: "keyword-chip", text: value })));
+  }
+
+  async function suggestTopicKeywords() {
+    if (!state.deepseek.configured) {
+      notify("请先配置并测试 DeepSeek API Key", "error");
+      openDeepSeekDialog();
+      return;
+    }
+    const name = refs.topicName.value.trim();
+    const keywords = splitKeywords(refs.topicKeywords.value);
+    if (!name || !keywords.length) {
+      notify("先填写主题名称和至少一个关键词", "error");
+      (name ? refs.topicKeywords : refs.topicName).focus();
+      return;
+    }
+    const body = {
+      name,
+      keywords,
+      exclusion_keywords: splitKeywords(refs.topicExcludes.value),
+      goal: `扩展“${name}”的检索关键词，同时保持主题边界。`
+    };
+    try {
+      const payload = await runButtonTask(refs.suggestTopic, async () => {
+        try {
+          return await api("/api/topics/suggest", { method: "POST", body, timeout: 45000 });
+        } catch (error) {
+          const topicId = refs.topicId.value;
+          if (!topicId || ![404, 405].includes(Number(error.status))) throw error;
+          return api(`/api/topics/${encodeURIComponent(topicId)}/calibrate`, { method: "POST", body: { goal: body.goal, positive_examples: [], negative_examples: [] }, timeout: 45000 });
+        }
+      }, { loading: "生成中", success: "建议已生成" });
+      const proposal = payload?.suggestion || payload?.proposal || payload?.calibration?.proposal || payload || {};
+      const suggested = splitKeywords(Array.isArray(proposal.keywords) ? proposal.keywords.join(",") : String(proposal.keywords || ""));
+      const newKeywords = suggested.filter((value) => !keywords.some((current) => current.toLocaleLowerCase() === value.toLocaleLowerCase()));
+      if (!newKeywords.length) {
+        notify("没有发现需要新增的关键词", "info");
+        return;
+      }
+      const availableSlots = Math.max(0, 40 - keywords.length);
+      if (!availableSlots) {
+        notify("当前主题已有 40 个关键词，请先删除一些再应用建议", "info");
+        return;
+      }
+      state.topicSuggestion = { keywords: newKeywords.slice(0, availableSlots), rationale: proposal.rationale || proposal.reason || "" };
+      refs.topicSuggestionCopy.textContent = state.topicSuggestion.rationale || "以下关键词尚未加入主题，请确认。";
+      refs.topicSuggestionChips.replaceChildren(...state.topicSuggestion.keywords.map((value) => node("span", { className: "keyword-chip", text: value })));
+      refs.topicSuggestion.hidden = false;
+    } catch (_) { /* runButtonTask or api already surfaced when applicable */ }
+  }
+
+  function applyTopicSuggestion() {
+    if (!state.topicSuggestion?.keywords?.length) return;
+    const combined = [...splitKeywords(refs.topicKeywords.value), ...state.topicSuggestion.keywords].slice(0, 40);
+    refs.topicKeywords.value = combined.join(", ");
+    state.topicSuggestion = null;
+    refs.topicSuggestion.hidden = true;
+    renderKeywordDrafts();
+    notify("关键词建议已加入草稿；保存主题后才会生效", "success");
   }
 
   function syncTopicDefaultControls() {
@@ -755,25 +1074,15 @@
       state.topics = state.topics.filter((item) => item.id !== topic.id);
       if (state.activeTopicId === topic.id) state.activeTopicId = null;
       renderAll();
+      await loadHistory({ quiet: true, append: false });
       notify(`已移除主题“${topic.name}”`, "success", {
         label: "撤销",
         callback: async () => {
-          await api("/api/topics", { method: "POST", body: topicPayload(topic) });
+          await api(`/api/topics/${encodeURIComponent(topic.id)}/restore`, { method: "POST" });
           await refreshBootstrap({ quiet: true });
         }
       });
     } catch (error) { notify(describeError(error), "error"); }
-  }
-
-  function topicPayload(topic) {
-    return {
-      name: topic.name,
-      keywords: topic.keywords || [],
-      threshold: topic.threshold,
-      article_limit: topic.article_limit,
-      source_ids: topic.source_ids || [],
-      enabled: topic.enabled !== false
-    };
   }
 
   function openSourceDialog(source = null) {
@@ -781,26 +1090,54 @@
     refs.sourceId.value = source?.id || "";
     refs.sourceDialogTitle.textContent = source ? "编辑来源" : "添加来源";
     refs.sourceName.value = source?.name || "";
+    refs.sourceHomepage.value = source?.homepage || "";
     refs.sourceUrl.value = source?.url || "";
+    refs.sourceCategory.value = source?.category || "general";
+    refs.sourceLanguage.value = source?.language || "zh";
+    refs.sourcePreset.value = source?.preset_id
+      ? `内置 v${source.preset_version || 1}${source.user_modified ? " · 已调整" : ""}`
+      : "自定义";
+    refs.sourceTerms.value = source?.terms || "";
     refs.sourceEnabled.checked = source ? Boolean(source.enabled) : true;
     refs.sourceValidation.hidden = true;
-    refs.validateSourceDraft.disabled = !source;
-    refs.validateSourceDraft.querySelector(".button__label").textContent = source ? "验证来源" : "保存后可验证";
+    syncSourceDraftValidation();
+    refs.validateSourceDraft.querySelector(".button__label").textContent = "验证草稿地址";
     openDialog(refs.sourceDialog, refs.sourceName);
+  }
+
+  function sourceDraftPayload() {
+    const current = refs.sourceId.value ? state.sources.find((source) => source.id === refs.sourceId.value) : null;
+    return {
+      name: refs.sourceName.value.trim() || "待验证来源",
+      url: refs.sourceUrl.value.trim(),
+      homepage: refs.sourceHomepage.value.trim() || null,
+      category: refs.sourceCategory.value,
+      language: refs.sourceLanguage.value,
+      terms: refs.sourceTerms.value.trim() || null,
+      preset_id: current?.preset_id || null,
+      preset_version: current?.preset_version || null,
+      enabled: refs.sourceEnabled.checked
+    };
+  }
+
+  function syncSourceDraftValidation() {
+    refs.validateSourceDraft.disabled = !refs.sourceUrl.value.trim() || !refs.sourceUrl.validity.valid;
   }
 
   async function submitSource(event) {
     event.preventDefault();
     if (!refs.sourceForm.reportValidity()) return;
+    if (!refs.sourceName.value.trim()) {
+      notify("请填写来源名称", "error");
+      refs.sourceName.focus();
+      return;
+    }
     const id = refs.sourceId.value;
-    const payload = {
-      name: refs.sourceName.value.trim(),
-      url: refs.sourceUrl.value.trim(),
-      enabled: refs.sourceEnabled.checked
-    };
+    const payload = sourceDraftPayload();
     const submit = refs.sourceForm.querySelector('[type="submit"]');
     try {
-      await runButtonTask(submit, () => api(id ? `/api/sources/${encodeURIComponent(id)}` : "/api/sources", { method: id ? "PUT" : "POST", body: payload }), {
+      const legacyPayload = { name: payload.name, url: payload.url, enabled: payload.enabled };
+      await runButtonTask(submit, () => apiWithLegacyBody(id ? `/api/sources/${encodeURIComponent(id)}` : "/api/sources", { method: id ? "PUT" : "POST", body: payload }, legacyPayload), {
         loading: "保存中", success: "已保存"
       });
       closeDialog(refs.sourceDialog);
@@ -811,7 +1148,8 @@
   async function validateSource(source, button) {
     try {
       const result = await runButtonTask(button, () => api(`/api/sources/${encodeURIComponent(source.id)}/validate`, { method: "POST" }), { loading: "验证中", success: "正常" });
-      notify(result?.sample_title ? `验证成功：${result.sample_title}` : "来源验证成功", "success");
+      const sample = result?.sample_title || result?.feed_title || result?.title;
+      notify(sample ? `验证成功：${sample}` : `来源验证成功${Number.isFinite(Number(result?.entry_count)) ? ` · ${result.entry_count} 条` : ""}`, "success");
       await refreshBootstrap({ quiet: true });
     } catch (error) {
       if (!button) notify(describeError(error), "error");
@@ -819,15 +1157,29 @@
   }
 
   async function validateDraftSource() {
+    if (!refs.sourceUrl.value.trim() || !refs.sourceUrl.validity.valid) {
+      refs.sourceUrl.reportValidity();
+      return;
+    }
     const id = refs.sourceId.value;
-    if (!id) return;
+    const draft = sourceDraftPayload();
     refs.sourceValidation.hidden = false;
     refs.sourceValidation.dataset.state = "running";
     refs.sourceValidation.textContent = "正在读取订阅地址…";
     try {
-      const result = await runButtonTask(refs.validateSourceDraft, () => api(`/api/sources/${encodeURIComponent(id)}/validate`, { method: "POST" }), { loading: "验证中", success: "验证通过" });
+      const result = await runButtonTask(refs.validateSourceDraft, async () => {
+        try {
+          return await api("/api/sources/validate", { method: "POST", body: draft, timeout: 45000 });
+        } catch (error) {
+          if (!id || ![404, 405].includes(Number(error.status))) throw error;
+          return api(`/api/sources/${encodeURIComponent(id)}/validate`, { method: "POST", timeout: 45000 });
+        }
+      }, { loading: "验证中", success: "验证通过" });
       refs.sourceValidation.dataset.state = "success";
-      refs.sourceValidation.textContent = result?.sample_title ? `读取成功：${result.sample_title}` : "读取成功，这个来源可以使用。";
+      const sample = result?.sample_title || result?.feed_title || result?.title;
+      refs.sourceValidation.textContent = sample
+        ? `读取成功：${sample}`
+        : `读取成功${Number.isFinite(Number(result?.entry_count)) ? ` · ${result.entry_count} 条` : ""}，这个来源可以使用。`;
       await refreshBootstrap({ quiet: true });
     } catch (error) {
       refs.sourceValidation.dataset.state = "error";
@@ -836,6 +1188,9 @@
   }
 
   async function deleteSource(source) {
+    const affectedTopics = state.topics
+      .filter((topic) => (topic.source_ids || []).includes(source.id))
+      .map((topic) => ({ id: topic.id, source_ids: [...topic.source_ids] }));
     try {
       await api(`/api/sources/${encodeURIComponent(source.id)}`, { method: "DELETE" });
       state.sources = state.sources.filter((item) => item.id !== source.id);
@@ -844,7 +1199,28 @@
       notify(`已移除来源“${source.name}”`, "success", {
         label: "撤销",
         callback: async () => {
-          await api("/api/sources", { method: "POST", body: { name: source.name, url: source.url, enabled: source.enabled !== false } });
+          try {
+            await api(`/api/sources/${encodeURIComponent(source.id)}/restore`, { method: "POST" });
+          } catch (error) {
+            if (!isCompatibilityError(error)) throw error;
+            const restoredPayload = {
+              name: source.name,
+              url: source.url,
+              homepage: source.homepage || null,
+              category: source.category || "general",
+              language: source.language || "zh",
+              terms: source.terms || null,
+              preset_id: source.preset_id || null,
+              enabled: source.enabled !== false
+            };
+            const legacy = { name: source.name, url: source.url, enabled: source.enabled !== false };
+            const response = await apiWithLegacyBody("/api/sources", { method: "POST", body: restoredPayload }, legacy);
+            const restoredId = response?.source?.id || source.id;
+            await Promise.all(affectedTopics.map((topic) => api(`/api/topics/${encodeURIComponent(topic.id)}`, {
+              method: "PUT",
+              body: { source_ids: topic.source_ids.map((id) => id === source.id ? restoredId : id) }
+            })));
+          }
           await refreshBootstrap({ quiet: true });
         }
       });
@@ -907,7 +1283,8 @@
   }
 
   async function toggleFavorite(article, button) {
-    if (!article.id) return;
+    if (!article.id || state.favoritePending.has(article.id)) return;
+    state.favoritePending.add(article.id);
     const next = !article.favorite;
     article.favorite = next;
     button.setAttribute("aria-pressed", String(next));
@@ -924,6 +1301,10 @@
       renderLatest();
       renderHistory();
       notify(describeError(error), "error");
+    } finally {
+      state.favoritePending.delete(article.id);
+      renderLatest();
+      renderHistory();
     }
   }
 
@@ -935,6 +1316,7 @@
   }
 
   async function startRun() {
+    if (state.runStarting || ACTIVE_RUN_STATES.has(state.currentRun?.status)) return;
     const enabledTopics = state.topics.filter((topic) => topic.enabled);
     const enabledSources = state.sources.filter((source) => source.enabled);
     if (!enabledTopics.length) {
@@ -947,13 +1329,51 @@
       openSourceDialog(state.sources[0] || null);
       return;
     }
+    const selectedTopic = state.activeTopicId ? state.topics.find((topic) => topic.id === state.activeTopicId) : null;
+    if (selectedTopic && !selectedTopic.enabled) {
+      notify("当前主题已停用，请先启用或选择“查看全部主题”", "error");
+      return;
+    }
+    const runTopics = selectedTopic ? [selectedTopic] : enabledTopics;
+    const enabledSourceIds = new Set(enabledSources.map((source) => source.id));
+    const unusable = runTopics.filter((topic) => (topic.source_ids || []).length && !(topic.source_ids || []).some((id) => enabledSourceIds.has(id)));
+    if (unusable.length) {
+      notify(`主题“${unusable[0].name}”没有可用来源，请先调整来源绑定`, "error");
+      openTopicDialog(unusable[0]);
+      return;
+    }
     const body = state.activeTopicId ? { topic_ids: [state.activeTopicId] } : {};
+    state.runStarting = true;
+    renderRunLane();
     try {
       const payload = await api("/api/runs", { method: "POST", body });
       state.currentRun = payload.run || null;
       renderRunLane();
       manageRunPolling();
-    } catch (error) { notify(describeError(error), "error"); }
+    } catch (error) {
+      if (!error.cockpitNotified) notify(describeError(error), "error");
+    } finally {
+      state.runStarting = false;
+      renderRunLane();
+    }
+  }
+
+  async function cancelRun() {
+    const run = state.currentRun;
+    if (!run?.id || !ACTIVE_RUN_STATES.has(run.status) || state.runCancelling) return;
+    state.runCancelling = true;
+    renderRunLane();
+    try {
+      const payload = await api(`/api/runs/${encodeURIComponent(run.id)}/cancel`, { method: "POST", body: {} });
+      state.currentRun = payload.run || { ...run, status: "cancelled", outcome: "cancelled", phase: "cancelled" };
+      notify("任务已取消，上一份有效报告继续保留", "info");
+    } catch (error) {
+      notify(describeError(error), "error");
+    } finally {
+      state.runCancelling = false;
+      renderRunLane();
+      manageRunPolling();
+    }
   }
 
   function manageRunPolling() {
@@ -982,10 +1402,12 @@
               ? "重复审核完成：近 7 天内没有新增新闻"
               : state.currentRun.status === "complete"
                 ? "本次报告已完成"
+                : state.currentRun.status === "cancelled"
+                  ? "本次任务已取消，旧报告已保留"
                 : state.currentRun.status === "degraded"
                   ? "本次抓取部分完成，旧报告保护已生效"
                   : "本次运行失败，旧报告已保留",
-            duplicateOnly ? "info" : state.currentRun.status === "complete" ? "success" : "error"
+            duplicateOnly || state.currentRun.status === "cancelled" ? "info" : state.currentRun.status === "complete" ? "success" : "error"
           );
         }
       }
@@ -1000,12 +1422,19 @@
       scheduler_enabled: refs.settingScheduler.checked,
       default_threshold: Number(refs.settingThreshold.value),
       default_article_limit: Number(refs.settingArticleLimit.value),
+      freshness_days: refs.settingFreshness.value === "" ? null : Number(refs.settingFreshness.value),
       refresh_minutes: Number(refs.settingRefresh.value),
-      extract_full_text: refs.settingExtract.checked
+      extract_full_text: refs.settingExtract.checked,
+      semantic_fallback_enabled: refs.settingSemantic.checked,
+      semantic_fallback_limit: Number(refs.settingSemanticLimit.value)
     };
+    const legacyPayload = { ...payload };
+    delete legacyPayload.freshness_days;
+    delete legacyPayload.semantic_fallback_enabled;
+    delete legacyPayload.semantic_fallback_limit;
     const submit = refs.settingsForm.querySelector('[type="submit"]');
     try {
-      const response = await runButtonTask(submit, () => api("/api/settings", { method: "PUT", body: payload }), { loading: "保存中", success: "已保存" });
+      const response = await runButtonTask(submit, () => apiWithLegacyBody("/api/settings", { method: "PUT", body: payload }, legacyPayload), { loading: "保存中", success: "已保存" });
       state.settings = { ...state.settings, ...(response.settings || payload) };
       closeDialog(refs.settingsDialog);
       renderMetrics();
@@ -1016,6 +1445,8 @@
   function openDeepSeekDialog() {
     refs.deepseekKey.value = "";
     refs.deepseekKey.type = "password";
+    refs.toggleKey.setAttribute("aria-label", "显示密钥");
+    refs.deepseekTestResult.hidden = true;
     renderDeepSeek();
     openDialog(refs.deepseekDialog, refs.deepseekKey);
   }
@@ -1031,6 +1462,7 @@
     try {
       const payload = await runButtonTask(submit, () => api("/api/settings/deepseek-key", { method: "PUT", body: { api_key: key } }), { loading: "保存中", success: "已保存" });
       state.deepseek = { ...state.deepseek, ...payload };
+      state.deepseek.status = normalizeDeepSeekStatus({ ...state.deepseek, ...payload, status: payload.status || "saved_unverified" });
       refs.deepseekKey.value = "";
       closeDialog(refs.deepseekDialog);
       renderDeepSeek();
@@ -1039,10 +1471,69 @@
 
   async function deleteDeepSeekKey() {
     try {
-      const payload = await runButtonTask(refs.deleteKey, () => api("/api/settings/deepseek-key", { method: "DELETE" }), { loading: "删除中", success: "已删除" });
+      const payload = await runButtonTask(refs.deleteKey, () => api("/api/settings/deepseek-key", { method: "DELETE" }), { loading: "删除中", success: "已删除", disabledAfter: true });
       state.deepseek = { ...state.deepseek, ...payload };
+      state.deepseek.status = "unconfigured";
+      refs.deepseekTestResult.hidden = true;
       renderDeepSeek();
     } catch (_) { /* surfaced */ }
+  }
+
+  async function testDeepSeek(button = refs.testKey, keyInput = refs.deepseekKey, resultBox = refs.deepseekTestResult) {
+    const key = keyInput?.value?.trim() || "";
+    if (!key && !state.deepseek.configured) {
+      notify("请先输入 DeepSeek API Key", "error");
+      keyInput?.focus();
+      return false;
+    }
+    resultBox.hidden = false;
+    resultBox.dataset.state = "running";
+    resultBox.textContent = "正在测试 DeepSeek 连接…";
+    try {
+      const body = key ? { api_key: key } : {};
+      const payload = await runButtonTask(button, async () => {
+        const result = await api("/api/settings/deepseek/test", { method: "POST", body, timeout: 45000 });
+        if (result?.status === "error" || result?.ok === false) {
+          const failure = new Error(result.error || "DeepSeek 连接测试失败");
+          failure.detail = result.error || failure.message;
+          failure.payload = result;
+          throw failure;
+        }
+        return result;
+      }, { loading: "测试中", success: "连接正常" });
+      state.deepseek = { ...state.deepseek, ...payload, configured: payload.configured ?? state.deepseek.configured, status: payload.status || "connected", error: null };
+      resultBox.dataset.state = "success";
+      resultBox.textContent = `连接正常 · ${payload.model || "deepseek-v4-flash"}${key ? " · 密钥已安全保存" : ""}`;
+      if (keyInput) keyInput.value = "";
+      renderDeepSeek();
+      return true;
+    } catch (error) {
+      const failurePayload = error.payload || {};
+      if (key) {
+        const persistedStatus = failurePayload.persisted_status;
+        if (["unconfigured", "saved_unverified", "connected", "error"].includes(persistedStatus)) {
+          state.deepseek = {
+            ...state.deepseek,
+            configured: failurePayload.configured ?? state.deepseek.configured,
+            status: persistedStatus,
+            error: persistedStatus === "error" ? failurePayload.persisted_error || state.deepseek.error : null
+          };
+        }
+      } else {
+        state.deepseek = {
+          ...state.deepseek,
+          configured: failurePayload.configured ?? state.deepseek.configured,
+          model: failurePayload.model || state.deepseek.model,
+          last_tested_at: failurePayload.last_tested_at ?? state.deepseek.last_tested_at,
+          status: "error",
+          error: describeError(error)
+        };
+      }
+      resultBox.dataset.state = "error";
+      resultBox.textContent = describeError(error);
+      renderDeepSeek();
+      return false;
+    }
   }
 
   async function exportData() {
@@ -1061,11 +1552,102 @@
     } catch (_) { /* surfaced */ }
   }
 
+  function chooseImportFile() {
+    if (ACTIVE_RUN_STATES.has(state.currentRun?.status) || state.runStarting) {
+      notify("新闻任务运行中，请完成或取消后再导入", "error");
+      return;
+    }
+    refs.importFile.value = "";
+    refs.importFile.click();
+  }
+
+  async function previewImport() {
+    const file = refs.importFile.files?.[0];
+    if (!file) return;
+    if (!file.name.toLocaleLowerCase().endsWith(".zip")) {
+      notify("请选择 Cookies News Cockpit 导出的 ZIP 备份", "error");
+      return;
+    }
+    if (file.size > 100 * 1024 * 1024) {
+      notify("备份文件不能超过 100 MiB", "error");
+      return;
+    }
+    try {
+      const payload = await runButtonTask(refs.importReport, () => api("/api/import/preview", {
+        method: "POST",
+        body: file,
+        headers: {
+          "Content-Type": file.type || "application/octet-stream",
+          "X-Import-Filename": encodeURIComponent(file.name)
+        },
+        timeout: 60000
+      }), { loading: "检查中", success: "可以导入" });
+      state.importPreview = payload;
+      renderImportPreview();
+      openDialog(refs.importDialog, refs.applyImport);
+    } catch (_) { /* surfaced by runButtonTask */ }
+  }
+
+  function renderImportPreview() {
+    const preview = state.importPreview || {};
+    const summary = preview.summary || preview.counts || {};
+    const rows = [
+      ["新增主题", summary.topics_new ?? summary.topics ?? 0],
+      ["新增来源", summary.sources_new ?? summary.sources ?? 0],
+      ["新增历史", summary.articles_new ?? summary.articles ?? 0],
+      ["新增任务记录", summary.runs_new ?? summary.runs ?? 0],
+      ["冲突项", summary.conflicts ?? preview.conflicts?.length ?? 0]
+    ];
+    const list = node("dl", { className: "import-summary" });
+    rows.forEach(([term, value]) => list.append(node("div", {}, [node("dt", { text: term }), node("dd", { text: String(value) })])));
+    refs.importPreview.replaceChildren(list);
+    const conflicts = Array.isArray(preview.conflicts) ? preview.conflicts : [];
+    if (conflicts.length) {
+      refs.importPreview.append(node("strong", { text: "冲突处理" }));
+      const conflictList = node("ul");
+      conflicts.slice(0, 20).forEach((item) => conflictList.append(node("li", { text: `${item.name || item.kind || "未命名项"}：${item.resolution || "保留本机版本"}` })));
+      refs.importPreview.append(conflictList);
+    }
+    const warnings = Array.isArray(preview.warnings) ? preview.warnings : [];
+    warnings.forEach((warning) => refs.importPreview.append(node("p", { className: "import-warning", text: warning })));
+    refs.applyImport.disabled = !(preview.import_id || preview.id) || preview.valid === false;
+  }
+
+  async function applyImport() {
+    const previewId = state.importPreview?.import_id || state.importPreview?.id;
+    if (!previewId) return;
+    if (ACTIVE_RUN_STATES.has(state.currentRun?.status) || state.runStarting) {
+      notify("新闻任务运行中，请完成或取消后再导入", "error");
+      return;
+    }
+    try {
+      const result = await runButtonTask(refs.applyImport, () => api(`/api/import/${encodeURIComponent(previewId)}/apply`, {
+        method: "POST",
+        body: { strategy: "merge_keep_local" },
+        timeout: 60000
+      }), { loading: "合并中", success: "导入完成" });
+      closeDialog(refs.importDialog);
+      state.importPreview = null;
+      await refreshBootstrap({ quiet: true });
+      notify(
+        result?.warning || `备份已安全合并；冲突项保留本机版本${result?.automatic_backup ? `，导入前备份：${result.automatic_backup}` : ""}`,
+        result?.warning ? "info" : "success"
+      );
+    } catch (_) { /* surfaced */ }
+  }
+
   async function shutdownApp() {
     try {
       await api("/api/shutdown", { method: "POST" });
       notify("应用正在安全退出", "success");
-      window.setTimeout(() => window.close(), 350);
+      refs.shutdownState.hidden = false;
+      refs.shutdownCopy.textContent = "正在尝试自动关闭页面…";
+      window.setTimeout(() => {
+        window.close();
+        window.setTimeout(() => {
+          refs.shutdownCopy.textContent = "浏览器没有允许自动关闭。应用服务已经退出，请手动关闭这个标签页。";
+        }, 500);
+      }, 350);
     } catch (error) { notify(describeError(error), "error"); }
   }
 
@@ -1080,7 +1662,15 @@
     const candidates = [];
     state.topics.forEach((topic) => candidates.push({
       group: "主题", title: topic.name, subtitle: topic.keywords?.join(" · ") || "未设置关键词", icon: "spark",
-      action: () => { state.activeTopicId = topic.id; renderTopicRail(); renderLatest(); document.getElementById("latest").scrollIntoView(); }
+      action: () => {
+        state.activeTopicId = topic.id;
+        state.reportFilter = "all";
+        updateReportFilterButtons();
+        renderTopicRail();
+        renderLatest();
+        renderRunLane();
+        document.getElementById("latest").scrollIntoView();
+      }
     }));
     state.sources.forEach((source) => candidates.push({
       group: "来源", title: source.name, subtitle: source.url, icon: "link",
@@ -1148,6 +1738,166 @@
     });
   }
 
+  function onboardingWasDismissed() {
+    try { return window.localStorage.getItem("cookies-cockpit-onboarding-complete") === "1"; } catch (_) { return false; }
+  }
+
+  function maybeOpenOnboarding(payload = {}) {
+    if (state.onboardingPresented || refs.onboardingDialog.open) return;
+    const completed = payload.settings?.onboarding_completed ?? state.settings.onboarding_completed;
+    const shouldOpen = completed === false || (completed === undefined && !state.topics.length && onboardingWasDismissed() === false);
+    if (!shouldOpen) return;
+    state.onboardingPresented = true;
+    state.onboardingStep = 0;
+    renderWizardSources();
+    renderWizard();
+    openDialog(refs.onboardingDialog, refs.wizardNext);
+  }
+
+  function renderWizardSources() {
+    const categories = new Map();
+    const available = state.sources.length ? state.sources : state.sourcePresets;
+    available.forEach((source) => {
+      const key = source.category || "general";
+      const current = categories.get(key) || { key, count: 0, enabled: false };
+      current.count += 1;
+      current.enabled ||= Boolean(source.enabled);
+      categories.set(key, current);
+    });
+    const labels = { general: "综合", business: "商业", technology: "科技", policy: "政策", industry: "行业", science: "科学", climate: "气候", world: "国际" };
+    refs.wizardSourceCategories.replaceChildren();
+    if (!categories.size) {
+      refs.wizardSourceCategories.append(node("p", { className: "helper-copy", text: "当前版本没有内置来源，可跳过并在驾驶舱中添加 RSS。" }));
+      return;
+    }
+    categories.forEach((category) => {
+      const input = node("input", { type: "checkbox", value: category.key, checked: category.enabled || category.key === "general" });
+      refs.wizardSourceCategories.append(node("label", { className: "check-option" }, [input, node("span", { text: `${labels[category.key] || category.key} · ${category.count} 个来源` })]));
+    });
+  }
+
+  function renderWizard() {
+    const content = [
+      ["先挑选新闻来源", "按分类启用来源，也可以稍后在驾驶舱里调整。"],
+      ["设置第一个主题", "用一个短名称和一组关键词划出新闻边界。"],
+      ["连接 DeepSeek", "测试成功后再运行；也可以跳过并使用规则初筛。"],
+      ["运行第一份报告", "设置已经就绪，开始后可在驾驶舱查看真实进度。"]
+    ][state.onboardingStep];
+    refs.onboardingStepLabel.textContent = `第 ${state.onboardingStep + 1} 步，共 4 步`;
+    refs.onboardingTitle.textContent = content[0];
+    refs.onboardingCopy.textContent = content[1];
+    document.querySelectorAll("[data-wizard-step]").forEach((step) => { step.hidden = Number(step.dataset.wizardStep) !== state.onboardingStep; });
+    document.querySelectorAll("[data-wizard-marker]").forEach((marker) => {
+      const position = Number(marker.dataset.wizardMarker);
+      marker.classList.toggle("is-active", position <= state.onboardingStep);
+      if (position === state.onboardingStep) marker.setAttribute("aria-current", "step");
+      else marker.removeAttribute("aria-current");
+    });
+    refs.wizardBack.disabled = state.onboardingBusy || state.onboardingStep === 0;
+    refs.wizardSkipStep.disabled = state.onboardingBusy;
+    refs.skipOnboarding.disabled = state.onboardingBusy;
+    refs.wizardTestKey.disabled = state.onboardingBusy;
+    delete refs.wizardNext.dataset.state;
+    refs.wizardNext.disabled = state.onboardingBusy;
+    refs.wizardNext.querySelector(".button__label").textContent = state.onboardingStep === 3 ? "开始运行" : "下一步";
+    refs.wizardSkipStep.querySelector(".button__label").textContent = state.onboardingStep === 3 ? "稍后运行" : "跳过此步";
+  }
+
+  async function saveWizardSourceChoices() {
+    const options = [...refs.wizardSourceCategories.querySelectorAll('input[type="checkbox"]')];
+    const selected = new Set(options.filter((input) => input.checked).map((input) => input.value));
+    const presets = state.sources.filter((source) => source.preset_id);
+    const changes = presets.filter((source) => selected.has(source.category || "general") !== Boolean(source.enabled));
+    await Promise.all(changes.map((source) => api(`/api/sources/${encodeURIComponent(source.id)}`, {
+      method: "PUT", body: { enabled: selected.has(source.category || "general") }
+    })));
+    return true;
+  }
+
+  async function saveWizardTopic() {
+    const name = refs.wizardTopicName.value.trim();
+    const keywords = splitKeywords(refs.wizardTopicKeywords.value);
+    if (!name || !keywords.length) {
+      notify("请填写主题名称和至少一个关键词，或选择跳过", "error");
+      (name ? refs.wizardTopicKeywords : refs.wizardTopicName).focus();
+      return false;
+    }
+    const body = { name, keywords: keywords.slice(0, 40), exclusion_keywords: [], source_ids: [], threshold: null, article_limit: null, enabled: true };
+    const legacy = { ...body };
+    delete legacy.exclusion_keywords;
+    await apiWithLegacyBody("/api/topics", { method: "POST", body }, legacy);
+    return true;
+  }
+
+  async function saveAndTestWizardKey() {
+    const key = refs.wizardDeepseekKey.value.trim();
+    if (!key) return true;
+    return testDeepSeek(refs.wizardTestKey, refs.wizardDeepseekKey, refs.wizardKeyResult);
+  }
+
+  async function advanceWizard({ skip = false } = {}) {
+    if (state.onboardingBusy) return;
+    state.onboardingBusy = true;
+    renderWizard();
+    try {
+      if (state.onboardingStep === 3) {
+        await completeOnboarding();
+        closeDialog(refs.onboardingDialog);
+        if (!skip) await startRun();
+        return;
+      }
+      if (!skip && state.onboardingStep === 0) {
+        const options = [...refs.wizardSourceCategories.querySelectorAll('input[type="checkbox"]')];
+        if (options.length && !options.some((input) => input.checked)) {
+          notify("请至少选择一个来源分类，或跳过此步保留默认来源", "error");
+          options[0].focus();
+          return;
+        }
+        await runButtonTask(refs.wizardNext, saveWizardSourceChoices, { loading: "保存中", success: "已选择" });
+      }
+      if (!skip && state.onboardingStep === 1) {
+        const saved = await runButtonTask(refs.wizardNext, saveWizardTopic, { loading: "保存中", success: "已保存" });
+        if (!saved) return;
+      }
+      if (!skip && state.onboardingStep === 2) {
+        const connected = await saveAndTestWizardKey();
+        if (!connected) return;
+      }
+      state.onboardingStep += 1;
+      await refreshBootstrap({ quiet: true });
+      renderWizard();
+    } catch (error) {
+      if (!error.cockpitNotified) notify(describeError(error), "error");
+    } finally {
+      state.onboardingBusy = false;
+      if (refs.onboardingDialog.open) renderWizard();
+    }
+  }
+
+  async function completeOnboarding() {
+    try { window.localStorage.setItem("cookies-cockpit-onboarding-complete", "1"); } catch (_) { /* storage may be unavailable */ }
+    state.settings.onboarding_completed = true;
+    try {
+      await api("/api/settings", { method: "PUT", body: { onboarding_completed: true } });
+    } catch (error) {
+      if (!isCompatibilityError(error)) throw error;
+    }
+  }
+
+  async function skipOnboarding() {
+    if (state.onboardingBusy) return;
+    state.onboardingBusy = true;
+    renderWizard();
+    try {
+      await completeOnboarding();
+    } catch (error) {
+      notify(describeError(error), "error");
+    } finally {
+      state.onboardingBusy = false;
+      closeDialog(refs.onboardingDialog);
+    }
+  }
+
   function updateReportFilterButtons() {
     document.querySelectorAll("[data-report-filter]").forEach((button) => {
       const active = button.dataset.reportFilter === state.reportFilter;
@@ -1166,12 +1916,17 @@
     refs.openDeepseek.addEventListener("click", openDeepSeekDialog);
     refs.deepseekAction.addEventListener("click", openDeepSeekDialog);
     refs.exportReport.addEventListener("click", exportData);
+    refs.importReport.addEventListener("click", chooseImportFile);
+    refs.importFile.addEventListener("change", previewImport);
+    refs.applyImport.addEventListener("click", applyImport);
     refs.shutdownApp.addEventListener("click", shutdownApp);
     refs.startRun.addEventListener("click", startRun);
+    refs.cancelRun.addEventListener("click", cancelRun);
     refs.showAllTopics.addEventListener("click", () => {
       state.activeTopicId = null;
       renderTopicRail();
       renderLatest();
+      renderRunLane();
     });
     document.querySelectorAll("[data-report-filter]").forEach((button) => button.addEventListener("click", () => {
       state.reportFilter = button.dataset.reportFilter;
@@ -1180,10 +1935,16 @@
     }));
 
     refs.topicForm.addEventListener("submit", submitTopic);
+    refs.topicKeywords.addEventListener("input", renderKeywordDrafts);
+    refs.topicExcludes.addEventListener("input", renderKeywordDrafts);
+    refs.suggestTopic.addEventListener("click", suggestTopicKeywords);
+    refs.applyTopicSuggestion.addEventListener("click", applyTopicSuggestion);
     refs.topicThresholdDefault.addEventListener("change", syncTopicDefaultControls);
     refs.topicLimitDefault.addEventListener("change", syncTopicDefaultControls);
     refs.sourceForm.addEventListener("submit", submitSource);
+    refs.sourceUrl.addEventListener("input", syncSourceDraftValidation);
     refs.settingsForm.addEventListener("submit", saveSettings);
+    refs.settingSemantic.addEventListener("change", syncSemanticControls);
     refs.deepseekForm.addEventListener("submit", saveDeepSeek);
     refs.historyFilter.addEventListener("submit", (event) => { event.preventDefault(); loadHistory({ append: false }); });
     refs.historyLoadMore.addEventListener("click", async () => {
@@ -1194,9 +1955,33 @@
     refs.validateSourceDraft.addEventListener("click", validateDraftSource);
     refs.confirmCalibration.addEventListener("click", confirmCalibration);
     refs.deleteKey.addEventListener("click", deleteDeepSeekKey);
+    refs.testKey.addEventListener("click", () => testDeepSeek());
     refs.toggleKey.addEventListener("click", () => {
       refs.deepseekKey.type = refs.deepseekKey.type === "password" ? "text" : "password";
       refs.toggleKey.setAttribute("aria-label", refs.deepseekKey.type === "password" ? "显示密钥" : "隐藏密钥");
+    });
+    refs.skipOnboarding.addEventListener("click", skipOnboarding);
+    refs.wizardSkipStep.addEventListener("click", () => advanceWizard({ skip: true }));
+    refs.wizardNext.addEventListener("click", () => advanceWizard());
+    refs.wizardBack.addEventListener("click", () => {
+      if (state.onboardingStep > 0) state.onboardingStep -= 1;
+      renderWizard();
+    });
+    refs.wizardTestKey.addEventListener("click", async () => {
+      if (!refs.wizardDeepseekKey.value.trim()) {
+        notify("请先输入 DeepSeek API Key", "error");
+        refs.wizardDeepseekKey.focus();
+        return;
+      }
+      if (state.onboardingBusy) return;
+      state.onboardingBusy = true;
+      renderWizard();
+      try {
+        await saveAndTestWizardKey();
+      } finally {
+        state.onboardingBusy = false;
+        if (refs.onboardingDialog.open) renderWizard();
+      }
     });
 
     document.querySelectorAll("[data-close-dialog]").forEach((button) => button.addEventListener("click", () => closeDialog(button.closest("dialog"))));

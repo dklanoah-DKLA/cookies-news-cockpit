@@ -4,11 +4,14 @@ import asyncio
 import io
 import json
 import logging
+import os
 import secrets
 import sqlite3
+import tempfile
 import time
 import zipfile
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -16,26 +19,177 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__
+from ._version import __version__
+from .backup import (
+    MAX_ARCHIVE_BYTES,
+    MAX_UNCOMPRESSED_BYTES,
+    BackupBundle,
+    BackupValidationError,
+    read_backup,
+)
 from .keystore import DeepSeekKeyStore, KeyStoreError
 from .models import (
     CalibrationConfirm,
     CalibrationRequest,
     DeepSeekKeyInput,
+    DeepSeekTestInput,
     FavoriteUpdate,
+    ImportApplyInput,
     RunRequest,
     SettingsUpdate,
     SourceInput,
     SourcePatch,
     TopicInput,
     TopicPatch,
+    TopicSuggestionInput,
 )
 from .pipeline import RunConflictError, RunManager
 from .runtime import AppPaths, resolve_paths
-from .services import DeepSeekError, FeedService, UnsafeUrlError
-from .storage import Database, NotFoundError, TopicLimitError
+from .services import DEEPSEEK_MODEL, DeepSeekError, FeedService, UnsafeUrlError
+from .storage import SCHEMA_VERSION, Database, NotFoundError, TopicLimitError, utc_now
 
 LOGGER = logging.getLogger(__name__)
+IMPORT_PREVIEW_TTL_SECONDS = 15 * 60
+BACKUP_PART_BYTES = 4 * 1024 * 1024
+
+
+def _deepseek_snapshot(db: Database, key_store: DeepSeekKeyStore) -> dict[str, Any]:
+    settings = db.get_settings()
+    try:
+        configured = bool(key_store.get())
+    except KeyStoreError as exc:
+        return {
+            "configured": False,
+            "status": "error",
+            "model": DEEPSEEK_MODEL,
+            "last_tested_at": settings.deepseek_last_tested_at,
+            "error": str(exc),
+        }
+    status = settings.deepseek_status if configured else "unconfigured"
+    if configured and status == "unconfigured":
+        # An environment-provided key, or a key restored outside the app, is
+        # configured but has not yet been verified by this database.
+        status = "saved_unverified"
+    return {
+        "configured": configured,
+        "status": status,
+        "model": DEEPSEEK_MODEL,
+        "last_tested_at": settings.deepseek_last_tested_at,
+        "error": settings.deepseek_last_error if status == "error" else None,
+    }
+
+
+def _write_json_parts(
+    archive: zipfile.ZipFile,
+    *,
+    index_name: str,
+    folder: str,
+    field: str,
+    rows: list[dict[str, Any]],
+) -> int:
+    parts: list[str] = []
+    current: list[bytes] = []
+    current_size = len(field.encode("utf-8")) + 16
+    raw_size = 0
+
+    def flush() -> None:
+        nonlocal current, current_size, raw_size
+        if not current:
+            return
+        name = f"{folder}/part-{len(parts) + 1:05d}.json"
+        payload = b'{"' + field.encode("utf-8") + b'":[' + b",".join(current) + b"]}"
+        archive.writestr(name, payload)
+        parts.append(name)
+        raw_size += len(payload)
+        current = []
+        current_size = len(field.encode("utf-8")) + 16
+
+    for row in rows:
+        encoded = json.dumps(
+            row,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if current and current_size + len(encoded) + 1 > BACKUP_PART_BYTES:
+            flush()
+        current.append(encoded)
+        current_size += len(encoded) + 1
+    flush()
+    index = json.dumps(
+        {"count": len(rows), "parts": parts},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    archive.writestr(index_name, index)
+    return raw_size + len(index)
+
+
+def _export_bytes(state: CockpitState) -> bytes:
+    configuration = {
+        "schema_version": SCHEMA_VERSION,
+        "settings": state.db.get_settings().model_dump(),
+        "topics": state.db.list_topics(include_archived=True),
+        "sources": state.db.list_sources(include_archived=True),
+        "deepseek_api_key_included": False,
+    }
+    history_rows = [
+        {key: value for key, value in article.items() if key != "full_text"}
+        for article in state.db.export_articles()
+    ]
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "product": "Cookies News Cockpit",
+        "app_version": __version__,
+        "created_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "deepseek_api_key_included": False,
+    }
+    output = io.BytesIO()
+    raw_size = 0
+    with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        manifest_payload = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+        configuration_payload = json.dumps(
+            configuration, ensure_ascii=False, indent=2
+        ).encode("utf-8")
+        archive.writestr("manifest.json", manifest_payload)
+        archive.writestr("configuration.json", configuration_payload)
+        raw_size += len(manifest_payload) + len(configuration_payload)
+        raw_size += _write_json_parts(
+            archive,
+            index_name="history.json",
+            folder="history",
+            field="articles",
+            rows=history_rows,
+        )
+        raw_size += _write_json_parts(
+            archive,
+            index_name="runs.json",
+            folder="runs",
+            field="runs",
+            rows=state.db.export_runs(),
+        )
+    payload = output.getvalue()
+    if raw_size > MAX_UNCOMPRESSED_BYTES or len(payload) > MAX_ARCHIVE_BYTES:
+        raise ValueError("完整备份超过安全上限，请先减少长期历史记录后再导出")
+    return payload
+
+
+def _write_automatic_backup(state: CockpitState, payload: bytes) -> Path:
+    destination_dir = state.paths.root / "backups"
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    destination = destination_dir / f"before-import-{stamp}-{secrets.token_hex(3)}.zip"
+    descriptor, temporary = tempfile.mkstemp(prefix=".backup-", suffix=".tmp", dir=destination_dir)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        Path(temporary).replace(destination)
+    finally:
+        temporary_path = Path(temporary)
+        if temporary_path.exists():
+            temporary_path.unlink()
+    return destination
 
 
 class CockpitState:
@@ -56,6 +210,31 @@ class CockpitState:
         self.last_scheduled_run = time.monotonic()
         self.shutdown_event = asyncio.Event()
         self.scheduler_task: asyncio.Task[None] | None = None
+        self.pending_imports: dict[str, tuple[float, BackupBundle]] = {}
+
+    def remember_import(self, bundle: BackupBundle) -> str:
+        now = time.monotonic()
+        # Only the newest preview can be applied. Reports have already yielded
+        # any v1 run metadata and are not needed during merge, so do not retain
+        # their duplicate article bodies in memory on an 8 GB target Mac.
+        self.pending_imports.clear()
+        bundle = BackupBundle(
+            bundle.schema_version,
+            bundle.configuration,
+            bundle.articles,
+            bundle.runs,
+            {},
+        )
+        import_id = secrets.token_urlsafe(18)
+        self.pending_imports[import_id] = (now, bundle)
+        return import_id
+
+    def get_import(self, import_id: str) -> BackupBundle:
+        value = self.pending_imports.get(import_id)
+        if value is None or time.monotonic() - value[0] >= IMPORT_PREVIEW_TTL_SECONDS:
+            self.pending_imports.pop(import_id, None)
+            raise NotFoundError("导入预览已过期，请重新选择备份")
+        return value[1]
 
     async def scheduler(self) -> None:
         while not self.shutdown_event.is_set():
@@ -198,9 +377,15 @@ def create_app(
         """
 
         return {
-            "product": {"name": "Cookies News Cockpit", "version": __version__, "mode": "local"},
+            "product": {
+                "name": "Cookies News Cockpit",
+                "version": __version__,
+                "mode": "local",
+                "schema_version": SCHEMA_VERSION,
+                "migration_warning": state.db.metadata_warning(),
+            },
             "settings": state.db.get_settings().model_dump(),
-            "deepseek": {"configured": bool(state.key_store.get()), "model": "deepseek-chat"},
+            "deepseek": _deepseek_snapshot(state.db, state.key_store),
             "topics": state.db.list_topics(),
             "sources": state.db.list_sources(),
             "current_run": state.db.get_current_run(),
@@ -211,7 +396,7 @@ def create_app(
     async def get_settings() -> dict[str, Any]:
         return {
             "settings": state.db.get_settings().model_dump(),
-            "deepseek": {"configured": bool(state.key_store.get()), "model": "deepseek-chat"},
+            "deepseek": _deepseek_snapshot(state.db, state.key_store),
         }
 
     @app.put("/api/settings")
@@ -221,12 +406,103 @@ def create_app(
     @app.put("/api/settings/deepseek-key")
     async def put_deepseek_key(value: DeepSeekKeyInput) -> dict[str, Any]:
         state.key_store.set(value.api_key)
-        return {"configured": True, "model": "deepseek-chat"}
+        state.db.update_settings(
+            SettingsUpdate(
+                deepseek_status="saved_unverified",
+                deepseek_last_tested_at=None,
+                deepseek_last_error=None,
+            )
+        )
+        return _deepseek_snapshot(state.db, state.key_store)
 
     @app.delete("/api/settings/deepseek-key")
     async def delete_deepseek_key() -> dict[str, Any]:
         state.key_store.delete()
-        return {"configured": False, "model": "deepseek-chat"}
+        state.db.update_settings(
+            SettingsUpdate(
+                deepseek_status="unconfigured",
+                deepseek_last_tested_at=None,
+                deepseek_last_error=None,
+            )
+        )
+        return _deepseek_snapshot(state.db, state.key_store)
+
+    @app.post("/api/settings/deepseek/test")
+    async def test_deepseek(value: DeepSeekTestInput | None = None) -> dict[str, Any]:
+        supplied_key = value.api_key if value else None
+        try:
+            api_key = supplied_key or state.key_store.get()
+        except KeyStoreError as exc:
+            state.db.update_settings(
+                SettingsUpdate(deepseek_status="error", deepseek_last_error=str(exc))
+            )
+            snapshot = _deepseek_snapshot(state.db, state.key_store)
+            snapshot["http_requests"] = 0
+            return snapshot
+        tested_at = utc_now()
+        if not api_key:
+            message = "请先输入或保存 DeepSeek API Key"
+            state.db.update_settings(
+                SettingsUpdate(
+                    deepseek_status="unconfigured",
+                    deepseek_last_tested_at=tested_at,
+                    deepseek_last_error=message,
+                )
+            )
+            return {
+                "status": "error",
+                "configured": False,
+                "model": DEEPSEEK_MODEL,
+                "last_tested_at": tested_at,
+                "error": message,
+                "http_requests": 0,
+            }
+        ai = state.manager.deepseek_factory(api_key)
+        try:
+            result = await ai.test_connection()
+        except DeepSeekError as exc:
+            message = str(exc)[:500]
+            if supplied_key:
+                # A typed key is only persisted after a successful test. Its
+                # failure must not overwrite the health of a different key
+                # already stored in the OS credential vault.
+                persisted = _deepseek_snapshot(state.db, state.key_store)
+                return {
+                    "status": "error",
+                    "configured": persisted["configured"],
+                    "persisted_status": persisted["status"],
+                    "model": DEEPSEEK_MODEL,
+                    "last_tested_at": tested_at,
+                    "error": message,
+                    "http_requests": exc.http_requests,
+                    "tested_temporary": True,
+                }
+            state.db.update_settings(
+                SettingsUpdate(
+                    deepseek_status="error",
+                    deepseek_last_tested_at=tested_at,
+                    deepseek_last_error=message,
+                )
+            )
+            snapshot = _deepseek_snapshot(state.db, state.key_store)
+            snapshot["http_requests"] = exc.http_requests
+            return snapshot
+        if supplied_key:
+            state.key_store.set(supplied_key)
+        state.db.update_settings(
+            SettingsUpdate(
+                deepseek_status="connected",
+                deepseek_last_tested_at=tested_at,
+                deepseek_last_error=None,
+            )
+        )
+        return {
+            "status": "connected",
+            "configured": True,
+            "model": DEEPSEEK_MODEL,
+            "last_tested_at": tested_at,
+            "http_requests": result.get("http_requests", 1),
+        }
 
     @app.get("/api/topics")
     async def list_topics() -> dict[str, Any]:
@@ -245,6 +521,48 @@ def create_app(
         state.db.delete_topic(topic_id)
         return {"archived": True}
 
+    @app.post("/api/topics/{topic_id}/restore")
+    async def restore_topic(topic_id: str) -> dict[str, Any]:
+        return {"topic": state.db.restore_topic(topic_id)}
+
+    @app.post("/api/topics/suggest")
+    async def suggest_topic(value: TopicSuggestionInput) -> dict[str, Any]:
+        api_key = state.key_store.get()
+        if not api_key:
+            raise HTTPException(status_code=409, detail="请先配置 DeepSeek API Key")
+        ai = state.manager.deepseek_factory(api_key)
+        topic = {
+            "name": value.name,
+            "keywords": value.keywords,
+            "exclusion_keywords": value.exclusion_keywords,
+        }
+        try:
+            proposal = await ai.calibrate(topic, value.goal, [], [])
+        except DeepSeekError as exc:
+            state.db.update_settings(
+                SettingsUpdate(
+                    deepseek_status="error",
+                    deepseek_last_tested_at=utc_now(),
+                    deepseek_last_error=str(exc)[:500],
+                )
+            )
+            raise
+        state.db.update_settings(
+            SettingsUpdate(
+                deepseek_status="connected",
+                deepseek_last_tested_at=utc_now(),
+                deepseek_last_error=None,
+            )
+        )
+        return {
+            "suggestion": {
+                "keywords": proposal.keywords,
+                "exclusion_keywords": value.exclusion_keywords,
+                "threshold": proposal.threshold,
+                "rationale": proposal.rationale,
+            }
+        }
+
     @app.post("/api/topics/{topic_id}/calibrate")
     async def calibrate_topic(topic_id: str, value: CalibrationRequest) -> dict[str, Any]:
         topic = state.db.get_topic(topic_id)
@@ -252,11 +570,29 @@ def create_app(
         if not api_key:
             raise HTTPException(status_code=409, detail="请先配置 DeepSeek API Key")
         ai = state.manager.deepseek_factory(api_key)
-        proposal = await ai.calibrate(
-            topic,
-            value.goal,
-            value.positive_examples,
-            value.negative_examples,
+        tested_at = utc_now()
+        try:
+            proposal = await ai.calibrate(
+                topic,
+                value.goal,
+                value.positive_examples,
+                value.negative_examples,
+            )
+        except DeepSeekError as exc:
+            state.db.update_settings(
+                SettingsUpdate(
+                    deepseek_status="error",
+                    deepseek_last_tested_at=tested_at,
+                    deepseek_last_error=str(exc)[:500],
+                )
+            )
+            raise
+        state.db.update_settings(
+            SettingsUpdate(
+                deepseek_status="connected",
+                deepseek_last_tested_at=tested_at,
+                deepseek_last_error=None,
+            )
         )
         return {"calibration": state.db.save_calibration(topic_id, proposal.model_dump())}
 
@@ -279,6 +615,15 @@ def create_app(
     async def create_source(value: SourceInput) -> dict[str, Any]:
         return {"source": state.db.create_source(value)}
 
+    @app.post("/api/sources/validate")
+    async def validate_source_draft(value: SourceInput) -> dict[str, Any]:
+        source = value.model_dump(mode="json")
+        source["id"] = "draft-source"
+        try:
+            return await state.manager.feed_service.validate(source)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"新闻源验证失败：{exc}") from exc
+
     @app.put("/api/sources/{source_id}")
     async def update_source(source_id: str, value: SourcePatch) -> dict[str, Any]:
         return {"source": state.db.update_source(source_id, value)}
@@ -287,6 +632,10 @@ def create_app(
     async def delete_source(source_id: str) -> dict[str, bool]:
         state.db.delete_source(source_id)
         return {"archived": True}
+
+    @app.post("/api/sources/{source_id}/restore")
+    async def restore_source(source_id: str) -> dict[str, Any]:
+        return {"source": state.db.restore_source(source_id)}
 
     @app.post("/api/sources/{source_id}/validate")
     async def validate_source(source_id: str) -> dict[str, Any]:
@@ -311,6 +660,10 @@ def create_app(
     async def get_run(run_id: str) -> dict[str, Any]:
         run = state.db.get_run(run_id)
         return {"run": run, "articles": state.db.list_run_articles(run_id)}
+
+    @app.post("/api/runs/{run_id}/cancel")
+    async def cancel_run(run_id: str) -> dict[str, Any]:
+        return {"run": await state.manager.cancel(run_id)}
 
     @app.get("/api/reports/latest")
     async def latest_report() -> dict[str, Any]:
@@ -342,33 +695,132 @@ def create_app(
 
     @app.get("/api/export")
     async def export_data() -> StreamingResponse:
-        output = io.BytesIO()
-        configuration = {
-            "schema_version": 1,
-            "settings": state.db.get_settings().model_dump(),
-            "topics": state.db.list_topics(include_archived=True),
-            "sources": state.db.list_sources(include_archived=True),
-            "deepseek_api_key_included": False,
-        }
-        history_rows = state.db.export_articles()
-        history_rows = [
-            {key: value for key, value in article.items() if key != "full_text"}
-            for article in history_rows
-        ]
-        with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr(
-                "configuration.json",
-                json.dumps(configuration, ensure_ascii=False, indent=2),
-            )
-            archive.writestr(
-                "history.json",
-                json.dumps({"articles": history_rows}, ensure_ascii=False, indent=2),
-            )
-            for path in sorted(state.paths.runs.glob("*.json")):
-                archive.write(path, f"reports/{path.name}")
-        output.seek(0)
+        output = io.BytesIO(_export_bytes(state))
         headers = {"Content-Disposition": 'attachment; filename="cookies-news-cockpit-export.zip"'}
         return StreamingResponse(output, media_type="application/zip", headers=headers)
+
+    @app.post("/api/import/preview")
+    async def preview_import(request: Request) -> dict[str, Any]:
+        declared = request.headers.get("content-length")
+        if declared:
+            try:
+                if int(declared) > MAX_ARCHIVE_BYTES:
+                    raise HTTPException(status_code=413, detail="备份超过 100 MiB 上限")
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Content-Length 无效") from None
+        payload = bytearray()
+        async for chunk in request.stream():
+            if len(payload) + len(chunk) > MAX_ARCHIVE_BYTES:
+                raise HTTPException(status_code=413, detail="备份超过 100 MiB 上限")
+            payload.extend(chunk)
+        try:
+            bundle = read_backup(bytes(payload))
+        except BackupValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        preview = state.db.preview_import(
+            bundle.configuration,
+            bundle.articles,
+            bundle.runs,
+        )
+        import_id = state.remember_import(bundle)
+        conflicts: list[dict[str, str]] = []
+        if preview["sources"]["matched"]:
+            conflicts.append(
+                {
+                    "kind": "source",
+                    "name": f"{preview['sources']['matched']} 个同地址来源",
+                    "resolution": "本机已修改的设置优先；全新内置占位项采用备份启停状态",
+                }
+            )
+        if preview["topics"]["matched"]:
+            conflicts.append(
+                {
+                    "kind": "topic",
+                    "name": f"{preview['topics']['matched']} 个同名主题",
+                    "resolution": "保留本机主题设置",
+                }
+            )
+        if preview["articles"]["matched"]:
+            conflicts.append(
+                {
+                    "kind": "article",
+                    "name": f"{preview['articles']['matched']} 条已有文章",
+                    "resolution": "不重复导入，收藏状态取并集",
+                }
+            )
+        if preview["runs"]["remapped"]:
+            conflicts.append(
+                {
+                    "kind": "run",
+                    "name": f"{preview['runs']['remapped']} 个同 ID 但内容不同的任务记录",
+                    "resolution": "保留本机记录；导入记录使用新的内部 ID",
+                }
+            )
+        return {
+            "import_id": import_id,
+            "summary": {
+                "schema_version": bundle.schema_version,
+                "topics_incoming": preview["topics"]["incoming"],
+                "topics_new": preview["topics"]["new"],
+                "sources_incoming": preview["sources"]["incoming"],
+                "sources_new": preview["sources"]["new"],
+                "articles_incoming": preview["articles"]["incoming"],
+                "articles_new": preview["articles"]["new"],
+                "runs_incoming": preview["runs"]["incoming"],
+                "runs_new": preview["runs"]["new"],
+                "runs_matched": preview["runs"]["matched"],
+                "runs_remapped": preview["runs"]["remapped"],
+                "conflicts": sum(
+                    preview[key]["matched"] for key in ("sources", "topics", "articles")
+                )
+                + preview["runs"]["remapped"],
+            },
+            "conflicts": conflicts,
+            "warnings": preview["warnings"],
+        }
+
+    @app.post("/api/import/{import_id}/apply")
+    async def apply_import(import_id: str, _value: ImportApplyInput) -> dict[str, Any]:
+        if state.manager.active:
+            raise HTTPException(status_code=409, detail="新闻任务运行中，完成或取消后再导入")
+        bundle = state.get_import(import_id)
+        previous_good = state.db.get_latest_good_run_id()
+        automatic_backup = _write_automatic_backup(state, _export_bytes(state))
+        result = state.db.apply_import(
+            bundle.configuration,
+            bundle.articles,
+            bundle.runs,
+        )
+        warning: str | None = None
+        run_id = result.get("latest_imported_run_id") or result.get("run_id")
+        if run_id:
+            run = state.db.get_run(run_id)
+            try:
+                state.manager._write_artifact(run, [])
+                if previous_good is None:
+                    state.db.set_latest_good_run(run_id)
+            except Exception:
+                warning = "历史已安全导入，但无法生成首页报告；仍可在历史记录中查看。"
+                LOGGER.exception("Could not promote imported run %s", run_id)
+        state.pending_imports.pop(import_id, None)
+        summary = {
+            "sources_new": result["sources_added"],
+            "sources_matched": result["sources_matched"],
+            "topics_new": result["topics_added"],
+            "topics_matched": result["topics_matched"],
+            "articles_new": result["articles_added"],
+            "articles_matched": result["articles_matched"],
+            "favorites_merged": result["favorites_merged"],
+            "runs_new": result["runs_added"],
+            "runs_matched": result["runs_matched"],
+            "runs_remapped": result["runs_remapped"],
+        }
+        return {
+            "applied": True,
+            "summary": summary,
+            "automatic_backup": automatic_backup.name,
+            "warning": warning,
+        }
 
     @app.post("/api/heartbeat")
     async def heartbeat() -> dict[str, Any]:

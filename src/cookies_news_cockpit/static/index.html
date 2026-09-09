@@ -121,12 +121,24 @@
                 <strong id="run-progress-title">正在抓取</strong>
                 <span id="run-progress-detail">准备新闻来源…</span>
               </div>
+              <button class="button button--quiet run-cancel" id="cancel-run" type="button"><span class="button__label">取消任务</span></button>
             </div>
             <div class="progress-track" role="progressbar" aria-label="抓取进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
               <span id="progress-fill"></span>
             </div>
+            <dl class="run-funnel" id="run-funnel" aria-label="本次任务处理漏斗">
+              <div><dt>抓取</dt><dd id="funnel-fetched">—</dd></div>
+              <div><dt>时效内</dt><dd id="funnel-fresh">—</dd></div>
+              <div><dt>关键词命中</dt><dd id="funnel-matched">—</dd></div>
+              <div><dt>全文提取</dt><dd id="funnel-fulltext">—</dd></div>
+              <div><dt>重复拦截</dt><dd id="funnel-duplicates">—</dd></div>
+              <div><dt>AI 请求</dt><dd id="funnel-ai">—</dd></div>
+              <div><dt>门槛淘汰</dt><dd id="funnel-threshold">—</dd></div>
+              <div><dt>最终入选</dt><dd id="funnel-kept">—</dd></div>
+            </dl>
           </div>
 
+          <div class="source-errors" id="source-errors" role="status" hidden></div>
           <div class="story-list" id="latest-list" aria-live="polite"></div>
         </section>
 
@@ -137,7 +149,8 @@
           </div>
           <dl class="run-spec">
             <div><dt>启动方式</dt><dd id="run-mode">手动</dd></div>
-            <div><dt>分析模型</dt><dd id="run-model">deepseek-chat</dd></div>
+            <div><dt>分析路径</dt><dd id="run-analysis-mode">规则筛选</dd></div>
+            <div><dt>分析模型</dt><dd id="run-model">deepseek-v4-flash</dd></div>
             <div><dt>处理上限</dt><dd id="run-cap">—</dd></div>
             <div><dt>重复审核</dt><dd id="run-dedupe">默认 · 近 7 天</dd></div>
             <div><dt>保留全文</dt><dd id="run-retention">30 天</dd></div>
@@ -151,7 +164,12 @@
               <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4"></path><path d="M5 18v3h14v-3"></path></svg>
               <span class="button__label">导出完整备份</span>
             </button>
-            <p class="export-note">包含配置、全部历史与报告，不含 API Key。</p>
+            <button class="button button--quiet button--full" id="import-report" type="button">
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21V9m0 0 4 4m-4-4-4 4"></path><path d="M5 6V3h14v3"></path></svg>
+              <span class="button__label">导入备份</span>
+            </button>
+            <input id="import-file" type="file" accept=".zip,application/zip" hidden>
+            <p class="export-note">包含配置、全部文章历史与任务记录，不含 API Key。</p>
           </div>
         </aside>
       </section>
@@ -281,14 +299,18 @@
         </div>
         <input id="topic-id" type="hidden">
         <label class="field"><span>主题名称</span><input id="topic-name" name="name" required maxlength="40" placeholder="例如：机器人与具身智能"><small>用你一眼能认出的短名称。</small></label>
-        <label class="field"><span>包含关键词</span><textarea id="topic-keywords" name="keywords" required rows="3" placeholder="机器人, 具身智能, humanoid"></textarea><small>用逗号分隔，中英文都可以。</small></label>
+        <label class="field"><span>包含关键词 <span class="field-count" id="topic-keyword-count">0 / 40</span></span><textarea id="topic-keywords" name="keywords" required rows="3" placeholder="机器人, 具身智能、humanoid"></textarea><small>支持逗号、顿号、分号或换行分隔；至少填写一个。</small></label>
+        <div class="chip-list" id="topic-keyword-chips" aria-live="polite"></div>
+        <label class="field"><span>排除词 <span class="field-count" id="topic-exclude-count">0 / 40</span></span><textarea id="topic-excludes" name="exclude_keywords" rows="2" placeholder="广告；招聘；软文"></textarea><small>标题或摘要命中排除词时优先剔除。</small></label>
+        <div class="chip-list chip-list--muted" id="topic-exclude-chips" aria-live="polite"></div>
         <div class="form-grid">
           <label class="field"><span>入选分数</span><input id="topic-threshold" name="threshold" type="number" min="0" max="100" step="1" value="60" required><small>0–100，越高越严格。</small><span class="default-control"><input id="topic-threshold-default" type="checkbox" checked><span>使用全局默认</span></span></label>
           <label class="field"><span>新闻数量</span><input id="topic-limit" name="article_limit" type="number" min="1" max="100" step="1" value="20" required><small>每次最多保留的条数。</small><span class="default-control"><input id="topic-limit-default" type="checkbox" checked><span>使用全局默认</span></span></label>
         </div>
         <fieldset class="field-group"><legend>使用来源</legend><div class="check-grid" id="topic-source-options"></div></fieldset>
         <label class="switch-row"><span><strong>启用主题</strong><small>关闭后保留设置，但不会参与抓取。</small></span><input id="topic-enabled" type="checkbox" checked><span class="switch-ui" aria-hidden="true"></span></label>
-        <div class="modal__actions"><button class="button button--quiet" type="button" data-close-dialog><span class="button__label">取消</span></button><button class="button button--primary" type="submit"><span class="button__label">保存主题</span></button></div>
+        <div class="suggestion-panel" id="topic-suggestion" hidden><div><strong>AI 关键词建议</strong><p id="topic-suggestion-copy">先预览，再决定是否加入。</p></div><div class="chip-list" id="topic-suggestion-chips"></div><button class="button button--secondary" id="apply-topic-suggestion" type="button"><span class="button__label">应用到草稿</span></button></div>
+        <div class="modal__actions modal__actions--split"><button class="button button--secondary" id="suggest-topic" type="button"><span class="button__label">AI 扩展关键词</span></button><span class="modal__action-pair"><button class="button button--quiet" type="button" data-close-dialog><span class="button__label">取消</span></button><button class="button button--primary" type="submit"><span class="button__label">保存主题</span></button></span></div>
       </form>
     </dialog>
 
@@ -300,11 +322,18 @@
         </div>
         <input id="source-id" type="hidden">
         <label class="field"><span>来源名称</span><input id="source-name" required maxlength="60" placeholder="例如：联合国新闻"><small>建议使用网站或栏目的正式名称。</small></label>
-        <label class="field"><span>订阅地址</span><input id="source-url" type="url" required placeholder="https://example.com/feed.xml" spellcheck="false"><small id="source-url-help">首版仅支持 RSS 与 Atom。</small></label>
+        <label class="field"><span>网站首页</span><input id="source-homepage" type="url" placeholder="https://example.com/" spellcheck="false"><small>用于识别来源；抓取不会读取这个地址。</small></label>
+        <label class="field"><span>RSS / Atom 订阅地址</span><input id="source-url" type="url" required placeholder="https://example.com/feed.xml" spellcheck="false"><small id="source-url-help">抓取实际使用这个地址，与网站首页分开填写。</small></label>
+        <div class="form-grid form-grid--three">
+          <label class="field"><span>分类</span><select id="source-category"><option value="general">综合</option><option value="world">国际</option><option value="business">商业</option><option value="technology">科技</option><option value="science">科学</option><option value="policy">政策</option><option value="industry">行业</option><option value="custom">其他</option></select></label>
+          <label class="field"><span>语言</span><select id="source-language"><option value="zh">中文</option><option value="en">英文</option><option value="multi">多语言</option><option value="other">其他</option></select></label>
+          <label class="field"><span>来源属性</span><input id="source-preset" value="自定义" readonly></label>
+        </div>
         <label class="field"><span>来源类型</span><input id="source-kind" value="RSS / Atom" readonly></label>
         <label class="switch-row"><span><strong>启用来源</strong><small>验证失败时也可以先保存为停用。</small></span><input id="source-enabled" type="checkbox" checked><span class="switch-ui" aria-hidden="true"></span></label>
+        <label class="field"><span>版权 / 使用条款页面</span><input id="source-terms" type="url" placeholder="https://example.com/terms" spellcheck="false"><small>可选；用于随时查阅来源规则，不参与抓取。</small></label>
         <div class="validation-result" id="source-validation" role="status" hidden></div>
-        <div class="modal__actions modal__actions--split"><button class="button button--secondary" id="validate-source-draft" type="button"><span class="button__label">先验证</span></button><span class="modal__action-pair"><button class="button button--quiet" type="button" data-close-dialog><span class="button__label">取消</span></button><button class="button button--primary" type="submit"><span class="button__label">保存来源</span></button></span></div>
+        <div class="modal__actions modal__actions--split"><button class="button button--secondary" id="validate-source-draft" type="button"><span class="button__label">验证草稿地址</span></button><span class="modal__action-pair"><button class="button button--quiet" type="button" data-close-dialog><span class="button__label">取消</span></button><button class="button button--primary" type="submit"><span class="button__label">保存来源</span></button></span></div>
       </form>
     </dialog>
 
@@ -319,9 +348,12 @@
           <label class="field"><span>默认入选分数</span><input id="setting-threshold" type="number" min="0" max="100" value="60" required></label>
           <label class="field"><span>默认新闻数量</span><input id="setting-article-limit" type="number" min="1" max="100" value="20" required></label>
         </div>
+        <label class="field"><span>新闻时效</span><select id="setting-freshness"><option value="1">最近 1 天</option><option value="3">最近 3 天</option><option value="7">最近 7 天</option><option value="14">最近 14 天</option><option value="30">最近 30 天</option><option value="">不限日期</option></select><small>有限时间窗会排除日期缺失、无效或明显来自未来的内容。</small></label>
         <label class="field"><span>自动抓取间隔</span><select id="setting-refresh"><option value="30">每 30 分钟</option><option value="60">每小时</option><option value="120">每 2 小时</option><option value="240">每 4 小时</option><option value="720">每 12 小时</option><option value="1440">每天</option></select></label>
         <label class="switch-row"><span><strong>提取全文</strong><small>开启后会读取正文帮助分析；全文缓存 30 天后自动清理。</small></span><input id="setting-extract" type="checkbox"><span class="switch-ui" aria-hidden="true"></span></label>
-        <div class="notice"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M12 11v5m0-8h.01"></path></svg><span>单次运行最多进行 500 次分析，这是防异常循环的技术保险，不是消费限额。</span></div>
+        <label class="switch-row"><span><strong>零命中时使用语义兜底</strong><small>仅在主题没有字面关键词命中时，交给 DeepSeek 复核少量候选。</small></span><input id="setting-semantic" type="checkbox"><span class="switch-ui" aria-hidden="true"></span></label>
+        <label class="field"><span>语义兜底候选上限</span><input id="setting-semantic-limit" type="number" min="1" max="20" value="20" required><small>每次最多 20 条；关闭语义兜底后不会产生这部分调用。</small></label>
+        <div class="notice"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M12 11v5m0-8h.01"></path></svg><span>单次运行最多分析 500 条候选，这是防异常循环的技术保险，不是消费限额。</span></div>
         <div class="modal__actions"><button class="button button--quiet" type="button" data-close-dialog><span class="button__label">取消</span></button><button class="button button--primary" type="submit"><span class="button__label">保存设置</span></button></div>
       </form>
     </dialog>
@@ -333,12 +365,31 @@
           <button class="icon-button" type="button" data-close-dialog aria-label="关闭 DeepSeek 设置"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"></path></svg></button>
         </div>
         <div class="key-status" id="key-status"><span class="status-dot" aria-hidden="true"></span><span>正在检查密钥状态…</span></div>
-        <label class="field"><span>模型</span><input id="deepseek-model" value="deepseek-chat" readonly><small>首版固定使用该模型。</small></label>
+        <label class="field"><span>模型</span><input id="deepseek-model" value="deepseek-v4-flash" readonly><small>1.1 固定使用当前 Flash 非思考模式。</small></label>
         <label class="field"><span>API Key</span><div class="input-action"><input id="deepseek-key" type="password" autocomplete="new-password" placeholder="sk-…" spellcheck="false"><button class="icon-button" id="toggle-key" type="button" aria-label="显示或隐藏密钥"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"></path><circle cx="12" cy="12" r="2.5"></circle></svg></button></div><small>留空不会改变现有密钥。</small></label>
-        <div class="notice notice--butter"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2.5 20h19L12 3Z"></path><path d="M12 9v5m0 3h.01"></path></svg><span>配置后，新闻标题、来源、摘要，以及开启全文提取时的正文会发送至 DeepSeek 云端分析。单次运行最多 500 次调用；实际费用以 DeepSeek 账单为准。</span></div>
-        <div class="modal__actions modal__actions--split"><button class="button button--danger-quiet" id="delete-key" type="button"><span class="button__label">删除密钥</span></button><span class="modal__action-pair"><button class="button button--quiet" type="button" data-close-dialog><span class="button__label">取消</span></button><button class="button button--primary" type="submit"><span class="button__label">保存密钥</span></button></span></div>
+        <div class="notice notice--butter"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2.5 20h19L12 3Z"></path><path d="M12 9v5m0 3h.01"></path></svg><span>配置后，新闻标题、来源、摘要，以及开启全文提取时的正文会发送至 DeepSeek 云端分析。单次运行最多分析 500 条候选；实际费用以 DeepSeek 账单为准。</span></div>
+        <div class="validation-result" id="deepseek-test-result" role="status" hidden></div>
+        <div class="modal__actions modal__actions--split"><span class="modal__action-pair"><button class="button button--danger-quiet" id="delete-key" type="button"><span class="button__label">删除密钥</span></button><button class="button button--secondary" id="test-key" type="button"><span class="button__label">测试连接</span></button></span><span class="modal__action-pair"><button class="button button--quiet" type="button" data-close-dialog><span class="button__label">取消</span></button><button class="button button--primary" type="submit"><span class="button__label">保存密钥</span></button></span></div>
       </form>
     </dialog>
+
+    <dialog class="modal onboarding-modal" id="onboarding-dialog" aria-labelledby="onboarding-title">
+      <div class="modal__surface form-stack">
+        <div class="modal__head"><div><p class="step-label" id="onboarding-step-label">第 1 步，共 4 步</p><h2 id="onboarding-title">先挑选新闻来源</h2><p id="onboarding-copy">按分类启用来源，也可以稍后在驾驶舱里调整。</p></div><button class="icon-button" id="skip-onboarding" type="button" aria-label="跳过首次设置"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"></path></svg></button></div>
+        <ol class="wizard-progress" aria-label="首次设置进度"><li data-wizard-marker="0" class="is-active">来源</li><li data-wizard-marker="1">主题</li><li data-wizard-marker="2">DeepSeek</li><li data-wizard-marker="3">运行</li></ol>
+        <section class="wizard-step" data-wizard-step="0"><fieldset class="field-group"><legend>来源分类</legend><div class="check-grid" id="wizard-source-categories"></div></fieldset><p class="helper-copy">没有合适来源？完成向导后可粘贴自己的 RSS / Atom 地址。</p></section>
+        <section class="wizard-step" data-wizard-step="1" hidden><label class="field"><span>第一个主题</span><input id="wizard-topic-name" maxlength="40" placeholder="例如：机器人与具身智能"></label><label class="field"><span>关键词</span><textarea id="wizard-topic-keywords" rows="3" placeholder="机器人、具身智能、humanoid"></textarea><small>至少一个，支持逗号、顿号、分号或换行。</small></label></section>
+        <section class="wizard-step" data-wizard-step="2" hidden><p class="notice">DeepSeek 可进行评分和摘要；不配置也能使用规则初筛。</p><label class="field"><span>API Key（可跳过）</span><input id="wizard-deepseek-key" type="password" autocomplete="new-password" placeholder="sk-…"></label><div class="validation-result" id="wizard-key-result" role="status" hidden></div><button class="button button--secondary" id="wizard-test-key" type="button"><span class="button__label">测试连接</span></button></section>
+        <section class="wizard-step" data-wizard-step="3" hidden><div class="empty-state empty-state--compact"><span class="empty-state__symbol" aria-hidden="true">🍪</span><h3>驾驶舱准备好了</h3><p>现在运行第一份报告；之后仍可修改全部设置。</p></div></section>
+        <div class="modal__actions modal__actions--split"><button class="button button--quiet" id="wizard-back" type="button"><span class="button__label">上一步</span></button><span class="modal__action-pair"><button class="button button--quiet" id="wizard-skip-step" type="button"><span class="button__label">跳过</span></button><button class="button button--primary" id="wizard-next" type="button"><span class="button__label">下一步</span></button></span></div>
+      </div>
+    </dialog>
+
+    <dialog class="modal" id="import-dialog" aria-labelledby="import-title">
+      <div class="modal__surface form-stack"><div class="modal__head"><div><h2 id="import-title">导入前预览</h2><p>不会覆盖现有内容；仅安全合并未重复的配置与历史。</p></div><button class="icon-button" type="button" data-close-dialog aria-label="关闭导入预览"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"></path></svg></button></div><div class="import-preview" id="import-preview"></div><div class="notice notice--butter">API Key 永远不会从备份导入。发生冲突时保留本机版本。</div><div class="modal__actions"><button class="button button--quiet" type="button" data-close-dialog><span class="button__label">取消</span></button><button class="button button--primary" id="apply-import" type="button"><span class="button__label">确认安全合并</span></button></div></div>
+    </dialog>
+
+    <div class="shutdown-state" id="shutdown-state" role="status" hidden><div><span aria-hidden="true">🍪</span><h2>应用已安全退出</h2><p id="shutdown-copy">正在尝试自动关闭页面…</p></div></div>
 
     <dialog class="modal" id="calibration-dialog" aria-labelledby="calibration-title">
       <div class="modal__surface form-stack">

@@ -11,7 +11,9 @@ if (!playwrightRoot) {
 const { chromium } = require(playwrightRoot);
 
 const cockpitUrl = process.env.COCKPIT_URL || "http://127.0.0.1:8765/#token=visual-test-token";
-const chromePath = process.env.CHROME_PATH || "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+const configuredChromePath = process.env.CHROME_PATH;
+const windowsChrome = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+const chromePath = configuredChromePath || (fs.existsSync(windowsChrome) ? windowsChrome : undefined);
 const outputDir = path.resolve(process.env.VISUAL_QA_OUTPUT || "artifacts/visual-qa");
 const viewports = [
   { name: "mobile-320", width: 320, height: 900 },
@@ -34,10 +36,19 @@ async function inspectViewport(browser, viewport) {
 
   await page.goto(cockpitUrl, { waitUntil: "networkidle" });
   await page.waitForSelector("#main-content");
+  const onboarding = page.locator("#onboarding-dialog");
+  if (await onboarding.evaluate((dialog) => dialog.open)) {
+    await page.locator("#skip-onboarding").click();
+    await onboarding.waitFor({ state: "hidden" });
+  }
   await page.evaluate(() => document.fonts.ready);
   await page.screenshot({
     path: path.join(outputDir, `${viewport.name}.png`),
     fullPage: true,
+  });
+  await page.screenshot({
+    path: path.join(outputDir, `${viewport.name}-fold.png`),
+    fullPage: false,
   });
 
   const measurements = await page.evaluate(() => {
@@ -84,12 +95,22 @@ async function inspectViewport(browser, viewport) {
         };
       })
       .filter((item) => item.width < 44 || item.height < 44);
+    const introBox = document.querySelector(".intro")?.getBoundingClientRect();
+    const primaryBox = document.querySelector("#start-run")?.getBoundingClientRect();
     return {
       horizontalOverflow: root.scrollWidth > root.clientWidth,
       scrollWidth: root.scrollWidth,
       clientWidth: root.clientWidth,
       wrapping,
       undersized,
+      heroFitsFold: Boolean(
+        introBox &&
+        primaryBox &&
+        introBox.top >= 0 &&
+        introBox.bottom <= window.innerHeight &&
+        primaryBox.top >= 0 &&
+        primaryBox.bottom <= window.innerHeight
+      ),
       serviceLabel: document.querySelector("#service-label")?.textContent?.trim() || "",
       addressBarTokenRemoved: location.hash === "" && !location.search.includes("token="),
     };
@@ -101,7 +122,9 @@ async function inspectViewport(browser, viewport) {
 
 async function main() {
   fs.mkdirSync(outputDir, { recursive: true });
-  const browser = await chromium.launch({ executablePath: chromePath, headless: true });
+  const browser = await chromium.launch(
+    chromePath ? { executablePath: chromePath, headless: true } : { headless: true },
+  );
   try {
     const results = [];
     for (const viewport of viewports) {
@@ -116,6 +139,7 @@ async function main() {
         result.horizontalOverflow ||
         result.wrapping.length > 0 ||
         result.undersized.length > 0 ||
+        !result.heroFitsFold ||
         result.consoleErrors.length > 0 ||
         result.pageErrors.length > 0 ||
         !result.addressBarTokenRemoved,

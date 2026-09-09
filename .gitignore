@@ -10,6 +10,7 @@ htmlcov/
 venv/
 .uv-cache/
 test-tmp-local/
+test-tmp-*/
 
 # Build and release outputs
 build/

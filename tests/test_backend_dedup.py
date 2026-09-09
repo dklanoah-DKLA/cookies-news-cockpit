@@ -286,7 +286,7 @@ def test_canonical_url_falls_back_for_malformed_port() -> None:
     assert index.is_duplicate(malformed, "英伟达发布新一代人工智能芯片平台")
 
 
-def test_history_index_excludes_hidden_degraded_and_failed_results(backend_home: Path) -> None:
+def test_history_index_includes_degraded_but_excludes_failed_results(backend_home: Path) -> None:
     paths = resolve_paths(backend_home)
     db = Database(paths.database)
     source = db.create_source(
@@ -310,12 +310,12 @@ def test_history_index_excludes_hidden_degraded_and_failed_results(backend_home:
         return run["id"]
 
     failed_id = insert_for("failed", "公司失败结果不应去重")
-    degraded_id = insert_for("degraded", "公司隐藏降级结果不应去重")
+    degraded_id = insert_for("degraded", "公司降级结果也应参与去重")
     complete_id = insert_for("complete", "公司完整报告应参与去重")
     db.set_latest_good_run(complete_id)
 
     indexed = {item["title"] for item in db.recent_article_fingerprints()}
-    assert indexed == {"公司完整报告应参与去重"}
+    assert indexed == {"公司完整报告应参与去重", "公司降级结果也应参与去重"}
     assert failed_id != degraded_id
 
 

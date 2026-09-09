@@ -9,5 +9,18 @@
     "nav": "N13 inline command-search pill",
     "footer": "Ft2 inline-rule single line",
     "brief": "Cookies News Cockpit local personal news workbench"
+  },
+  {
+    "date": "2026-09-09",
+    "version": "1.1.0",
+    "macrostructure": "Workbench",
+    "variation_knobs": "funnel-first canvas / run-state inspector / four-step onboarding",
+    "theme": "custom",
+    "theme_axes": "light / display-heavy / warm",
+    "vibe": "cookie-white, warm, exact, gently playful",
+    "enrichment": "Tier A native-cookie sticker field",
+    "nav": "N13 inline command-search pill",
+    "footer": "Ft2 inline-rule single line",
+    "brief": "Cookies News Cockpit 1.1 source, filtering, migration, and audit upgrade"
   }
 ]

@@ -4,16 +4,16 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "版本号（例如 0.1.0）"
+        description: "版本号（必须与源码一致，例如 1.1.0）"
         required: true
-        default: "0.1.0"
+        default: "1.1.0"
         type: string
   push:
     tags:
       - "v*"
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: macos-intel-${{ github.ref }}
@@ -23,7 +23,7 @@ jobs:
   build-intel-dmg:
     name: Test and package x86_64 app
     runs-on: macos-15-intel
-    timeout-minutes: 35
+    timeout-minutes: 45
 
     steps:
       - name: Check out source
@@ -35,6 +35,11 @@ jobs:
           python-version: "3.12"
           architecture: "x64"
           cache: "pip"
+
+      - name: Set up Node.js for browser QA
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
 
       - name: Resolve safe version
         env:
@@ -60,10 +65,73 @@ jobs:
           python -m pip install ".[dev]"
 
       - name: Run automated tests
-        run: python -m pytest
+        run: |
+          python -m ruff check src tests
+          python -m pytest
+
+      - name: Install browser test driver
+        run: |
+          npm install --no-save --no-package-lock --ignore-scripts playwright@1.55.0
+          if [[ ! -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ]]; then
+            npx playwright install chromium
+          fi
+
+      - name: Run browser workflow and responsive QA
+        env:
+          CODEX_PLAYWRIGHT_ROOT: ${{ github.workspace }}/node_modules/playwright
+          E2E_PYTHON: python
+        run: |
+          chrome="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          if [[ -x "${chrome}" ]]; then
+            export CHROME_PATH="${chrome}"
+          fi
+          node scripts/e2e_qa.cjs
+          visual_home="$(mktemp -d)"
+          python scripts/e2e_fixture_server.py \
+            --home "${visual_home}" \
+            --port 8765 \
+            --token visual-test-token \
+            >"${RUNNER_TEMP}/cockpit-visual.log" 2>&1 &
+          visual_pid="$!"
+          cleanup_visual() {
+            kill "${visual_pid}" 2>/dev/null || true
+            wait "${visual_pid}" 2>/dev/null || true
+          }
+          trap cleanup_visual EXIT
+          for attempt in {1..40}; do
+            if curl --fail --silent http://127.0.0.1:8765/ >/dev/null; then
+              break
+            fi
+            sleep 0.25
+          done
+          node scripts/visual_qa.cjs
 
       - name: Build, ad-hoc sign and package
         run: bash packaging/build_macos.sh
+
+      - name: Smoke-test the packaged application
+        run: |
+          smoke_home="$(mktemp -d)"
+          executable="dist/Cookies News Cockpit.app/Contents/MacOS/Cookies News Cockpit"
+          HOME="${smoke_home}" "${executable}" --port 38119 --no-browser >"${RUNNER_TEMP}/cockpit-smoke.log" 2>&1 &
+          smoke_pid="$!"
+          cleanup() {
+            kill "${smoke_pid}" 2>/dev/null || true
+            wait "${smoke_pid}" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          for attempt in {1..40}; do
+            if curl --fail --silent --show-error http://127.0.0.1:38119/ | grep -q "Cookies News Cockpit"; then
+              exit 0
+            fi
+            if ! kill -0 "${smoke_pid}" 2>/dev/null; then
+              cat "${RUNNER_TEMP}/cockpit-smoke.log" >&2
+              exit 1
+            fi
+            sleep 0.25
+          done
+          cat "${RUNNER_TEMP}/cockpit-smoke.log" >&2
+          exit 1
 
       - name: Record package facts
         run: |
@@ -92,3 +160,47 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
+
+      - name: Upload browser QA evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: Cookies-News-Cockpit-${{ env.APP_VERSION }}-QA
+          path: |
+            artifacts/e2e-qa
+            artifacts/visual-qa
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Publish permanent GitHub Release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release_title="Cookies News Cockpit ${APP_VERSION}"
+          release_notes="Intel macOS 14+ build. This release is ad-hoc signed and not Apple-notarized; follow the first-launch instructions in README.md."
+
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists; its named assets and standard notes will be refreshed."
+          else
+            if ! gh release create "${GITHUB_REF_NAME}" \
+                --verify-tag \
+                --draft \
+                --title "${release_title}" \
+                --notes "${release_notes}"; then
+              echo "Release creation returned an error; checking whether another publisher created it." >&2
+              gh release view "${GITHUB_REF_NAME}" >/dev/null
+            fi
+          fi
+
+          gh release upload "${GITHUB_REF_NAME}" \
+            release/*.dmg \
+            release/*.dmg.zip \
+            release/SHA256SUMS.txt \
+            --clobber
+
+          gh release edit "${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --draft=false \
+            --title "${release_title}" \
+            --notes "${release_notes}"

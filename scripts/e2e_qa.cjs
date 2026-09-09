@@ -132,12 +132,49 @@ async function main() {
       return "URL 中 token 已清除，sessionStorage 会话及本地连接正常";
     });
 
+    const suffix = `${process.pid}-${Date.now()}`;
+    const onboardingTopic = `首次向导 ${suffix}`;
+    await runCheck("首次向导完成来源、主题与稍后运行", async () => {
+      const dialog = page.locator("#onboarding-dialog");
+      await dialog.waitFor({ state: "visible" });
+      assert.match(await page.locator("#onboarding-step-label").textContent(), /第 1 步，共 4 步/);
+      assert.ok(await page.locator("#wizard-source-categories input:checked").count() >= 1);
+      await page.locator("#wizard-next").click();
+      await page.locator("#wizard-topic-name").fill(onboardingTopic);
+      await page.locator("#wizard-topic-keywords").fill("机器人、robotics；具身智能");
+      await page.locator("#wizard-next").click();
+      await page.waitForFunction(() => document.querySelector("#onboarding-step-label")?.textContent.includes("第 3 步"));
+      assert.match(await page.locator("#onboarding-step-label").textContent(), /第 3 步，共 4 步/);
+      await page.locator("#wizard-skip-step").click();
+      await page.waitForFunction(() => document.querySelector("#onboarding-step-label")?.textContent.includes("第 4 步"));
+      assert.match(await page.locator("#onboarding-step-label").textContent(), /第 4 步，共 4 步/);
+      await page.locator("#wizard-skip-step").click();
+      await dialog.waitFor({ state: "hidden" });
+      const settings = await apiJson(page, "/api/settings");
+      const topics = await apiJson(page, "/api/topics");
+      assert.equal(settings.body.settings.onboarding_completed, true);
+      const savedTopic = topics.body.topics.find((item) => item.name === onboardingTopic);
+      assert.ok(savedTopic);
+      assert.deepEqual(savedTopic.keywords, ["机器人", "robotics", "具身智能"]);
+      return "4 步向导可完成，主题和完成状态已写入本机";
+    });
+
     await runCheck("默认重复新闻审核可见", async () => {
       assert.equal((await page.locator("#run-dedupe").textContent()).trim(), "默认 · 近 7 天");
       return "本次任务显示“默认 · 近 7 天”";
     });
 
-    const suffix = `${process.pid}-${Date.now()}`;
+    await runCheck("首次向导四步可跳过", async () => {
+      const dialog = page.locator("#onboarding-dialog");
+      if (await dialog.evaluate((element) => element.open)) {
+        assert.equal(await dialog.locator("[data-wizard-marker]").count(), 4);
+        await page.locator("#skip-onboarding").click();
+        await dialog.waitFor({ state: "hidden" });
+        return "来源→主题→DeepSeek→运行四步齐全，整段跳过可用";
+      }
+      return "已有设置，向导按约定不重复出现";
+    });
+
     const topicName = `E2E 机器人 ${suffix}`;
     await runCheck("新建主题并保存全局默认 null", async () => {
       await page.locator("#add-topic").click();
@@ -148,6 +185,7 @@ async function main() {
       assert.equal(await page.locator("#topic-limit").isDisabled(), true);
       await page.locator("#topic-name").fill(topicName);
       await page.locator("#topic-keywords").fill("机器人, 具身智能, robot");
+      assert.equal(await page.locator("#topic-keywords").inputValue(), "机器人, 具身智能, robot");
       const formValidity = await page.locator("#topic-form").evaluate((form) => ({
         valid: form.checkValidity(),
         invalid: [...form.querySelectorAll(":invalid")].map((field) => ({
@@ -245,7 +283,7 @@ async function main() {
       assert.match(text, /不会写进导出文件/);
       assert.match(text, /新闻标题、来源、摘要/);
       assert.match(text, /正文会发送至 DeepSeek 云端/);
-      assert.match(text, /500 次调用/);
+      assert.match(text, /最多分析 500 条候选/);
       assert.match(text, /实际费用以 DeepSeek 账单为准/);
       await dialog.getByRole("button", { name: "取消" }).click();
       return "数据范围、云端传输、500 次技术上限与账单口径均明确";
@@ -260,6 +298,16 @@ async function main() {
       await download.saveAs(downloadPath);
       assert.ok(fs.statSync(downloadPath).size > 200);
       return `${download.suggestedFilename()} (${fs.statSync(downloadPath).size} bytes)`;
+    });
+
+    await runCheck("导入预览显示任务记录", async () => {
+      const backupPath = path.join(outputDir, "cookies-news-cockpit-export.zip");
+      await page.locator("#import-file").setInputFiles(backupPath);
+      const dialog = page.locator("#import-dialog");
+      await dialog.waitFor({ state: "visible" });
+      await dialog.getByText("新增任务记录", { exact: true }).waitFor();
+      await dialog.getByRole("button", { name: "关闭导入预览" }).click();
+      return "安全合并前会单独列出新增任务记录数";
     });
 
     await runCheck("浏览器流程无真实外网请求", async () => {

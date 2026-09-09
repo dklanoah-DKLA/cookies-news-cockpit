@@ -50,7 +50,7 @@ def test_interface_matches_the_feed_only_v1_contract() -> None:
     assert "JSON API" not in combined
     assert "retention_days" not in combined
     assert "max_analysis" not in combined
-    assert "deepseek-chat" in combined
+    assert "deepseek-v4-flash" in combined
     for setting in (
         "default_threshold",
         "default_article_limit",

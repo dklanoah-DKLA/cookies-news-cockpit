@@ -3,12 +3,20 @@
 
 import os
 from pathlib import Path
+from runpy import run_path
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 
 PROJECT_ROOT = Path(SPECPATH).resolve().parent
-APP_VERSION = os.environ.get("APP_VERSION", "0.1.0")
+SOURCE_VERSION = run_path(
+    str(PROJECT_ROOT / "src" / "cookies_news_cockpit" / "_version.py")
+)["__version__"]
+APP_VERSION = os.environ.get("APP_VERSION", SOURCE_VERSION)
+if APP_VERSION != SOURCE_VERSION:
+    raise SystemExit(
+        f"Build version {APP_VERSION} does not match source version {SOURCE_VERSION}"
+    )
 APP_NAME = "Cookies News Cockpit"
 ICON_PATH = PROJECT_ROOT / "build" / "CookiesNewsCockpit.icns"
 
