@@ -114,6 +114,8 @@
             </div>
           </div>
 
+          <div class="report-context" id="report-context" role="status" hidden></div>
+
           <div class="run-progress" id="run-progress" hidden>
             <div class="run-progress__copy">
               <span class="spinner" aria-hidden="true"></span>
@@ -126,16 +128,45 @@
             <div class="progress-track" role="progressbar" aria-label="抓取进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
               <span id="progress-fill"></span>
             </div>
-            <dl class="run-funnel" id="run-funnel" aria-label="本次任务处理漏斗">
-              <div><dt>抓取</dt><dd id="funnel-fetched">—</dd></div>
-              <div><dt>时效内</dt><dd id="funnel-fresh">—</dd></div>
-              <div><dt>关键词命中</dt><dd id="funnel-matched">—</dd></div>
-              <div><dt>全文提取</dt><dd id="funnel-fulltext">—</dd></div>
-              <div><dt>重复拦截</dt><dd id="funnel-duplicates">—</dd></div>
-              <div><dt>AI 请求</dt><dd id="funnel-ai">—</dd></div>
-              <div><dt>门槛淘汰</dt><dd id="funnel-threshold">—</dd></div>
-              <div><dt>最终入选</dt><dd id="funnel-kept">—</dd></div>
-            </dl>
+            <div class="run-funnel" id="run-funnel" aria-label="本次任务处理漏斗">
+              <section class="funnel-group" aria-labelledby="funnel-discovery-title">
+                <h3 id="funnel-discovery-title">发现</h3>
+                <dl>
+                  <div><dt>抓取条目</dt><dd id="funnel-fetched">—</dd></div>
+                  <div><dt>时效内</dt><dd id="funnel-fresh">—</dd></div>
+                  <div><dt>关键词命中</dt><dd id="funnel-matched">—</dd></div>
+                  <div><dt>去重候选</dt><dd id="funnel-unique">—</dd></div>
+                </dl>
+              </section>
+              <section class="funnel-group" aria-labelledby="funnel-processing-title">
+                <h3 id="funnel-processing-title">处理</h3>
+                <dl>
+                  <div><dt>全文尝试</dt><dd id="funnel-fulltext">—</dd></div>
+                  <div><dt>全文成功</dt><dd id="funnel-fulltext-success">—</dd></div>
+                  <div><dt>语义首批</dt><dd id="funnel-semantic-initial">—</dd></div>
+                  <div><dt>语义追加</dt><dd id="funnel-semantic-additional">—</dd></div>
+                  <div><dt>语义复核</dt><dd id="funnel-semantic">—</dd></div>
+                  <div><dt>AI 请求</dt><dd id="funnel-ai">—</dd></div>
+                  <div><dt>AI 成功</dt><dd id="funnel-ai-success">—</dd></div>
+                  <div><dt>AI 失败</dt><dd id="funnel-ai-failure">—</dd></div>
+                  <div><dt>历史重复</dt><dd id="funnel-history-duplicates">—</dd></div>
+                  <div><dt>本次重复</dt><dd id="funnel-run-duplicates">—</dd></div>
+                  <div><dt>重复合计</dt><dd id="funnel-duplicates">—</dd></div>
+                </dl>
+              </section>
+              <section class="funnel-group" aria-labelledby="funnel-result-title">
+                <h3 id="funnel-result-title">结果</h3>
+                <dl>
+                  <div><dt>核心新闻</dt><dd id="funnel-core">—</dd></div>
+                  <div><dt>补充阅读</dt><dd id="funnel-supplement">—</dd></div>
+                  <div><dt>低于补充线</dt><dd id="funnel-below-supplement">—</dd></div>
+                  <div><dt>门槛淘汰</dt><dd id="funnel-threshold">—</dd></div>
+                  <div><dt>预算已用尽</dt><dd id="funnel-budget">—</dd></div>
+                  <div><dt>最终入选</dt><dd id="funnel-kept">—</dd></div>
+                </dl>
+              </section>
+            </div>
+            <div class="funnel-breakdown" id="funnel-breakdown"></div>
           </div>
 
           <div class="source-errors" id="source-errors" role="status" hidden></div>
@@ -309,7 +340,7 @@
         </div>
         <fieldset class="field-group"><legend>使用来源</legend><div class="check-grid" id="topic-source-options"></div></fieldset>
         <label class="switch-row"><span><strong>启用主题</strong><small>关闭后保留设置，但不会参与抓取。</small></span><input id="topic-enabled" type="checkbox" checked><span class="switch-ui" aria-hidden="true"></span></label>
-        <div class="suggestion-panel" id="topic-suggestion" hidden><div><strong>AI 关键词建议</strong><p id="topic-suggestion-copy">先预览，再决定是否加入。</p></div><div class="chip-list" id="topic-suggestion-chips"></div><button class="button button--secondary" id="apply-topic-suggestion" type="button"><span class="button__label">应用到草稿</span></button></div>
+        <div class="suggestion-panel" id="topic-suggestion" hidden><div><strong>AI 关键词建议</strong><p id="topic-suggestion-copy">只提供建议，不会自动修改；确认后才加入草稿。</p></div><div class="chip-list" id="topic-suggestion-chips"></div><button class="button button--secondary" id="apply-topic-suggestion" type="button"><span class="button__label">确认加入草稿</span></button></div>
         <div class="modal__actions modal__actions--split"><button class="button button--secondary" id="suggest-topic" type="button"><span class="button__label">AI 扩展关键词</span></button><span class="modal__action-pair"><button class="button button--quiet" type="button" data-close-dialog><span class="button__label">取消</span></button><button class="button button--primary" type="submit"><span class="button__label">保存主题</span></button></span></div>
       </form>
     </dialog>
@@ -351,8 +382,8 @@
         <label class="field"><span>新闻时效</span><select id="setting-freshness"><option value="1">最近 1 天</option><option value="3">最近 3 天</option><option value="7">最近 7 天</option><option value="14">最近 14 天</option><option value="30">最近 30 天</option><option value="">不限日期</option></select><small>有限时间窗会排除日期缺失、无效或明显来自未来的内容。</small></label>
         <label class="field"><span>自动抓取间隔</span><select id="setting-refresh"><option value="30">每 30 分钟</option><option value="60">每小时</option><option value="120">每 2 小时</option><option value="240">每 4 小时</option><option value="720">每 12 小时</option><option value="1440">每天</option></select></label>
         <label class="switch-row"><span><strong>提取全文</strong><small>开启后会读取正文帮助分析；全文缓存 30 天后自动清理。</small></span><input id="setting-extract" type="checkbox"><span class="switch-ui" aria-hidden="true"></span></label>
-        <label class="switch-row"><span><strong>零命中时使用语义兜底</strong><small>仅在主题没有字面关键词命中时，交给 DeepSeek 复核少量候选。</small></span><input id="setting-semantic" type="checkbox"><span class="switch-ui" aria-hidden="true"></span></label>
-        <label class="field"><span>语义兜底候选上限</span><input id="setting-semantic-limit" type="number" min="1" max="20" value="20" required><small>每次最多 20 条；关闭语义兜底后不会产生这部分调用。</small></label>
+        <label class="switch-row"><span><strong>结果不足时智能补充</strong><small>首批规则结果不足时，交给 DeepSeek 复核有限候选，补足有价值的补充阅读。</small></span><input id="setting-semantic" type="checkbox"><span class="switch-ui" aria-hidden="true"></span></label>
+        <label class="field"><span>智能补充首批上限</span><input id="setting-semantic-limit" type="number" min="1" max="20" value="20" required><small>首批最多 20 条；仍不足时系统最多追加 15 条。关闭后不产生这部分调用。</small></label>
         <div class="notice"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M12 11v5m0-8h.01"></path></svg><span>单次运行最多分析 500 条候选，这是防异常循环的技术保险，不是消费限额。</span></div>
         <div class="modal__actions"><button class="button button--quiet" type="button" data-close-dialog><span class="button__label">取消</span></button><button class="button button--primary" type="submit"><span class="button__label">保存设置</span></button></div>
       </form>
@@ -365,7 +396,7 @@
           <button class="icon-button" type="button" data-close-dialog aria-label="关闭 DeepSeek 设置"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"></path></svg></button>
         </div>
         <div class="key-status" id="key-status"><span class="status-dot" aria-hidden="true"></span><span>正在检查密钥状态…</span></div>
-        <label class="field"><span>模型</span><input id="deepseek-model" value="deepseek-v4-flash" readonly><small>1.1 固定使用当前 Flash 非思考模式。</small></label>
+        <label class="field"><span>模型</span><input id="deepseek-model" value="deepseek-v4-flash" readonly><small>1.2 固定使用当前 Flash 非思考模式。</small></label>
         <label class="field"><span>API Key</span><div class="input-action"><input id="deepseek-key" type="password" autocomplete="new-password" placeholder="sk-…" spellcheck="false"><button class="icon-button" id="toggle-key" type="button" aria-label="显示或隐藏密钥"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"></path><circle cx="12" cy="12" r="2.5"></circle></svg></button></div><small>留空不会改变现有密钥。</small></label>
         <div class="notice notice--butter"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2.5 20h19L12 3Z"></path><path d="M12 9v5m0 3h.01"></path></svg><span>配置后，新闻标题、来源、摘要，以及开启全文提取时的正文会发送至 DeepSeek 云端分析。单次运行最多分析 500 条候选；实际费用以 DeepSeek 账单为准。</span></div>
         <div class="validation-result" id="deepseek-test-result" role="status" hidden></div>
@@ -386,7 +417,7 @@
     </dialog>
 
     <dialog class="modal" id="import-dialog" aria-labelledby="import-title">
-      <div class="modal__surface form-stack"><div class="modal__head"><div><h2 id="import-title">导入前预览</h2><p>不会覆盖现有内容；仅安全合并未重复的配置与历史。</p></div><button class="icon-button" type="button" data-close-dialog aria-label="关闭导入预览"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"></path></svg></button></div><div class="import-preview" id="import-preview"></div><div class="notice notice--butter">API Key 永远不会从备份导入。发生冲突时保留本机版本。</div><div class="modal__actions"><button class="button button--quiet" type="button" data-close-dialog><span class="button__label">取消</span></button><button class="button button--primary" id="apply-import" type="button"><span class="button__label">确认安全合并</span></button></div></div>
+      <div class="modal__surface form-stack"><div class="modal__head"><div><h2 id="import-title">导入前预览</h2><p>不会覆盖现有内容；仅安全合并未重复的配置与历史。</p></div><button class="icon-button" type="button" data-close-dialog aria-label="关闭导入预览"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"></path></svg></button></div><div class="import-preview" id="import-preview"></div><label class="check-control import-portable"><input id="import-portable-settings" type="checkbox"><span><strong>恢复便携设置</strong><small>默认不恢复；勾选后仅导入门槛、数量、时效、刷新间隔、全文与智能补充设置。</small></span></label><div class="notice notice--butter">API Key 永远不会从备份导入；DeepSeek 连接状态与首次设置状态也不会导入。发生冲突时保留本机主题、来源与历史。</div><div class="modal__actions"><button class="button button--quiet" type="button" data-close-dialog><span class="button__label">取消</span></button><button class="button button--primary" id="apply-import" type="button"><span class="button__label">确认安全合并</span></button></div></div>
     </dialog>
 
     <div class="shutdown-state" id="shutdown-state" role="status" hidden><div><span aria-hidden="true">🍪</span><h2>应用已安全退出</h2><p id="shutdown-copy">正在尝试自动关闭页面…</p></div></div>

@@ -380,7 +380,7 @@ async def test_zero_hit_fulltext_review_is_source_round_robin_and_can_recover_ma
 
 
 @pytest.mark.asyncio
-async def test_semantic_fallback_is_capped_at_twenty_for_entire_run(
+async def test_semantic_fallback_uses_initial_budget_then_bounded_expansion(
     backend_home: Path,
 ) -> None:
     db, paths = _workspace(backend_home)
@@ -392,12 +392,12 @@ async def test_semantic_fallback_is_capped_at_twenty_for_entire_run(
             name="Semantic",
             keywords=["literal-never-present"],
             threshold=50,
-            article_limit=30,
+            article_limit=40,
             source_ids=[first["id"], second["id"]],
         )
     )
     items = {first["id"]: [], second["id"]: []}
-    for index in range(25):
+    for index in range(50):
         source = first if index % 2 == 0 else second
         items[source["id"]].append(
             _article(
@@ -423,13 +423,16 @@ async def test_semantic_fallback_is_capped_at_twenty_for_entire_run(
     run = await manager.run_now(RunRequest(), trigger="manual")
     articles = db.list_run_articles(run["id"])
 
-    assert ai.calls == 20
+    assert ai.calls == 35
     assert ai.source_ids[:4] == [first["id"], second["id"], first["id"], second["id"]]
-    assert run["article_count"] == 20
-    assert run["analyses"] == 20
-    assert run["ai_requests"] == 20
-    assert run["ai_success"] == 20
-    assert run["funnel"]["semantic_fallback"] == 20
+    assert run["article_count"] == 35
+    assert run["analyses"] == 35
+    assert run["ai_requests"] == 35
+    assert run["ai_success"] == 35
+    assert run["funnel"]["semantic_fallback"] == 35
+    assert run["funnel"]["semantic_initial_reviewed"] == 20
+    assert run["funnel"]["semantic_additional_reviewed"] == 15
+    assert run["funnel"]["semantic_budget_exhausted"] == 15
     assert all(item["analysis_mode"] == "ai_semantic" for item in articles)
     assert all(item["matched_keywords"] == [] for item in articles)
 
@@ -707,7 +710,7 @@ async def test_empty_runs_report_precise_outcome(
 
 
 @pytest.mark.asyncio
-async def test_fulltext_enrichment_is_limited_to_shortlist(backend_home: Path) -> None:
+async def test_fulltext_enrichment_stops_when_topic_target_is_met(backend_home: Path) -> None:
     db, paths = _workspace(backend_home)
     source = db.create_source(SourceInput(name="Feed", url="https://feed.example/rss"))
     db.create_topic(
@@ -729,6 +732,6 @@ async def test_fulltext_enrichment_is_limited_to_shortlist(backend_home: Path) -
     run = await manager.run_now(RunRequest(), trigger="manual")
 
     assert feeds.feed_calls == [source["id"]]
-    assert len(feeds.enrich_calls) == 20
-    assert run["funnel"]["fulltext_fetches"] == 20
+    assert len(feeds.enrich_calls) == 1
+    assert run["funnel"]["fulltext_fetches"] == 1
     assert run["article_count"] == 1

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Stale RSS Fixture</title>
+    <link>https://fixture.example/</link>
+    <description>Valid but too old.</description>
+    <item>
+      <title>Old story</title>
+      <link>https://fixture.example/old</link>
+      <pubDate>Wed, 01 Jan 2020 08:00:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>

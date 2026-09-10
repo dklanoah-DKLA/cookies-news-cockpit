@@ -28,7 +28,7 @@ def test_runtime_and_build_dependencies_are_declared() -> None:
     assert configuration["tool"]["setuptools"]["dynamic"]["version"] == {
         "attr": "cookies_news_cockpit._version.__version__"
     }
-    assert '__version__ = "1.1.0"' in read("src/cookies_news_cockpit/_version.py")
+    assert '__version__ = "1.2.0"' in read("src/cookies_news_cockpit/_version.py")
     assert {
         "beautifulsoup4",
         "fastapi",
@@ -157,7 +157,7 @@ def test_readme_distinguishes_candidate_artifacts_from_web_published_releases() 
     assert "这个 Actions artifact **只是候选测试包**" in readme
     assert "30 天后会过期" in readme
     assert "**Releases** 页面，点 **Draft a new release**" in readme
-    assert "**Create new tag: v1.1.0 on publish**" in readme
+    assert "**Create new tag: v1.2.0 on publish**" in readme
     assert "不要手动上传从 Actions 下载的外层 ZIP" in readme
     assert "覆盖同名资产并更新标准标题和说明" in readme
     assert "三个资产齐全" in readme

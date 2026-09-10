@@ -29,7 +29,7 @@ def test_clean_database_has_v2_defaults_and_neutral_catalog(storage_home: Path) 
     assert db.get_schema_version() == 2
     assert db.get_settings().freshness_days == 7
     assert db.get_settings().onboarding_completed is False
-    assert len(sources) == 16
+    assert len(sources) == 24
     assert enabled_presets == {
         "preset-chinanews-scroll",
         "preset-un-zh",
@@ -99,7 +99,7 @@ def test_v1_upgrade_preserves_scope_and_archives_untouched_chinaorg(
 
     # A second startup is idempotent and does not re-enable new defaults.
     reopened = Database(path)
-    assert len(reopened.list_sources()) == 16
+    assert len(reopened.list_sources()) == 24
     assert sum(item["enabled"] for item in reopened.list_sources()) == 1
 
 

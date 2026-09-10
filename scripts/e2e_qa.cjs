@@ -13,7 +13,7 @@ const playwrightModule = process.env.CODEX_PLAYWRIGHT_ROOT || "playwright";
 const { chromium } = require(playwrightModule);
 const outputDir = path.resolve(process.env.E2E_QA_OUTPUT || path.join(projectRoot, "artifacts", "e2e-qa"));
 const sessionToken = `e2e-${process.pid}-${Date.now()}`;
-const report = { status: "running", checks: [], externalRequests: [], requestFailures: [], consoleErrors: [] };
+const report = { status: "running", checks: [], externalRequests: [], requestFailures: [], consoleErrors: [], pageErrors: [] };
 
 function check(name, detail = "pass") {
   report.checks.push({ name, status: "pass", detail });
@@ -114,6 +114,7 @@ async function main() {
     page.on("console", (message) => {
       if (message.type() === "error") report.consoleErrors.push(message.text());
     });
+    page.on("pageerror", (error) => report.pageErrors.push(error.message));
     page.on("request", (request) => {
       const hostname = new URL(request.url()).hostname;
       if (!["127.0.0.1", "localhost"].includes(hostname)) report.externalRequests.push(request.url());
@@ -124,7 +125,17 @@ async function main() {
 
     await runCheck("会话令牌清除并连接本地服务", async () => {
       await page.goto(`${baseUrl}/#token=${encodeURIComponent(sessionToken)}`, { waitUntil: "networkidle" });
-      await page.waitForFunction(() => document.body.dataset.connection === "online");
+      try {
+        await page.waitForFunction(() => document.body.dataset.connection === "online");
+      } catch (error) {
+        const state = await page.evaluate(() => ({
+          connection: document.body.dataset.connection || null,
+          readyState: document.readyState,
+          tokenStored: Boolean(sessionStorage.getItem("cookies-cockpit-token")),
+          offlineCopy: document.querySelector("#offline-banner")?.textContent?.replace(/\s+/g, " ").trim() || null
+        }));
+        throw new Error(`${error.message}; browser state=${JSON.stringify(state)}; pageErrors=${JSON.stringify(report.pageErrors)}`);
+      }
       assert.equal(new URL(page.url()).hash, "");
       assert.equal(new URL(page.url()).search, "");
       assert.equal(await page.evaluate(() => sessionStorage.getItem("cookies-cockpit-token")), sessionToken);
@@ -289,6 +300,89 @@ async function main() {
       return "数据范围、云端传输、500 次技术上限与账单口径均明确";
     });
 
+    await runCheck("1.2 分层报告、三段漏斗与智能补充文案", async () => {
+      assert.deepEqual(
+        await page.locator("#run-funnel .funnel-group > h3").allTextContents(),
+        ["发现", "处理", "结果"],
+      );
+      assert.equal(await page.locator("#report-context").count(), 1);
+      assert.equal(await page.locator("#funnel-breakdown").count(), 1);
+      await page.locator("#open-settings").click();
+      const dialog = page.locator("#settings-dialog");
+      const text = (await dialog.textContent()).replace(/\s+/g, " ");
+      assert.match(text, /结果不足时智能补充/);
+      assert.match(text, /首批最多 20 条/);
+      assert.match(text, /最多追加 15 条/);
+      await dialog.getByRole("button", { name: "取消" }).click();
+      return "发现/处理/结果三段结构与20+15受控补充说明均可见";
+    });
+
+    await runCheck("导入主题 ID 重映射后按唯一主题名恢复报告分层", async () => {
+      const probe = await context.newPage();
+      try {
+        await probe.route("**/app.js", async (route) => {
+          const response = await route.fetch();
+          const source = await response.text();
+          assert.match(source, /  init\(\);/);
+          await route.fulfill({
+            response,
+            body: source.replace(
+              "  init();",
+              "  window.__tierProbe = { topicFunnelFor, articleTier };\n  init();",
+            ),
+          });
+        });
+        await probe.goto(`${baseUrl}/#token=${encodeURIComponent(sessionToken)}`, { waitUntil: "networkidle" });
+        const tiers = await probe.evaluate(() => {
+          const report = {
+            run: {
+              funnel: {
+                per_topic: {
+                  "incoming-topic-id": {
+                    name: "ESG",
+                    core_threshold: 70,
+                    supplement_threshold: 50,
+                  },
+                },
+              },
+            },
+          };
+          const ambiguous = {
+            run: {
+              funnel: {
+                per_topic: {
+                  first: { name: "ESG", core_threshold: 70, supplement_threshold: 50 },
+                  second: { name: "esg", core_threshold: 70, supplement_threshold: 50 },
+                },
+              },
+            },
+          };
+          return {
+            uniqueSupplement: window.__tierProbe.articleTier(
+              { topic_id: "local-topic-id", topic_name: "eSg", score: 60 },
+              report,
+            ),
+            uniqueCore: window.__tierProbe.articleTier(
+              { topic_id: "local-topic-id", topic_name: "esg", score: 75 },
+              report,
+            ),
+            ambiguousFallback: window.__tierProbe.articleTier(
+              { topic_id: "local-topic-id", topic_name: "ESG", score: 60 },
+              ambiguous,
+            ),
+          };
+        });
+        assert.deepEqual(tiers, {
+          uniqueSupplement: "supplement",
+          uniqueCore: "core",
+          ambiguousFallback: "core",
+        });
+      } finally {
+        await probe.close();
+      }
+      return "ID 不同但主题名唯一时恢复阈值；同名歧义时不猜测";
+    });
+
     await runCheck("导出完整备份", async () => {
       const downloadPromise = page.waitForEvent("download");
       await page.locator("#export-report").click();
@@ -300,14 +394,19 @@ async function main() {
       return `${download.suggestedFilename()} (${fs.statSync(downloadPath).size} bytes)`;
     });
 
-    await runCheck("导入预览显示任务记录", async () => {
+    await runCheck("导入预览显示任务记录并显式恢复便携设置", async () => {
       const backupPath = path.join(outputDir, "cookies-news-cockpit-export.zip");
       await page.locator("#import-file").setInputFiles(backupPath);
       const dialog = page.locator("#import-dialog");
       await dialog.waitFor({ state: "visible" });
       await dialog.getByText("新增任务记录", { exact: true }).waitFor();
-      await dialog.getByRole("button", { name: "关闭导入预览" }).click();
-      return "安全合并前会单独列出新增任务记录数";
+      const portable = page.locator("#import-portable-settings");
+      assert.equal(await portable.isChecked(), false);
+      assert.match((await dialog.textContent()).replace(/\s+/g, " "), /API Key 永远不会从备份导入/);
+      await portable.check();
+      await page.locator("#apply-import").click();
+      await dialog.waitFor({ state: "hidden" });
+      return "任务记录单列；便携设置默认关闭，显式勾选后可安全合并";
     });
 
     await runCheck("浏览器流程无真实外网请求", async () => {

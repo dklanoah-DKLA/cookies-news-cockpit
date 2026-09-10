@@ -79,6 +79,64 @@ def _deepseek_snapshot(db: Database, key_store: DeepSeekKeyStore) -> dict[str, A
     }
 
 
+def _topic_funnel_snapshot(run: dict[str, Any], article: dict[str, Any]) -> dict[str, Any]:
+    """Find a topic's immutable run-time thresholds without trusting current settings."""
+
+    funnel = run.get("funnel")
+    if not isinstance(funnel, dict):
+        return {}
+    per_topic = funnel.get("per_topic")
+    if not isinstance(per_topic, dict):
+        return {}
+    topic_id = article.get("topic_id")
+    snapshot = per_topic.get(topic_id)
+    if isinstance(snapshot, dict):
+        return snapshot
+
+    # A safe import can map an incoming topic ID onto an existing local topic.
+    # The frozen run funnel intentionally remains unchanged, so use its unique
+    # topic name as a compatibility bridge when the IDs no longer match.
+    topic_name = article.get("topic_name")
+    if not isinstance(topic_name, str) or not topic_name.strip():
+        return {}
+    matches = [
+        value
+        for value in per_topic.values()
+        if isinstance(value, dict)
+        and isinstance(value.get("name"), str)
+        and value["name"].casefold() == topic_name.casefold()
+    ]
+    return matches[0] if len(matches) == 1 else {}
+
+
+def _articles_with_selection_tier(
+    run: dict[str, Any], articles: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Layer the 1.2 core/supplement decision onto stored schema-v2 articles."""
+
+    layered: list[dict[str, Any]] = []
+    for article in articles:
+        snapshot = _topic_funnel_snapshot(run, article)
+        score = article.get("score")
+        core_threshold = snapshot.get("core_threshold")
+        supplement_threshold = snapshot.get("supplement_threshold")
+        if (
+            isinstance(score, (int, float))
+            and not isinstance(score, bool)
+            and isinstance(core_threshold, (int, float))
+            and not isinstance(core_threshold, bool)
+            and isinstance(supplement_threshold, (int, float))
+            and not isinstance(supplement_threshold, bool)
+        ):
+            selection_tier = "core" if score >= core_threshold else "supplement"
+        else:
+            # Pre-1.2 and imported legacy runs had only one display tier. Keep
+            # them readable rather than guessing from today's mutable settings.
+            selection_tier = "core"
+        layered.append({**article, "selection_tier": selection_tier})
+    return layered
+
+
 def _write_json_parts(
     archive: zipfile.ZipFile,
     *,
@@ -659,7 +717,10 @@ def create_app(
     @app.get("/api/runs/{run_id}")
     async def get_run(run_id: str) -> dict[str, Any]:
         run = state.db.get_run(run_id)
-        return {"run": run, "articles": state.db.list_run_articles(run_id)}
+        articles = _articles_with_selection_tier(
+            run, state.db.list_run_articles(run_id)
+        )
+        return {"run": run, "articles": articles}
 
     @app.post("/api/runs/{run_id}/cancel")
     async def cancel_run(run_id: str) -> dict[str, Any]:
@@ -775,6 +836,7 @@ def create_app(
                 )
                 + preview["runs"]["remapped"],
             },
+            "portable_settings": preview["portable_settings"],
             "conflicts": conflicts,
             "warnings": preview["warnings"],
         }
@@ -790,6 +852,9 @@ def create_app(
             bundle.configuration,
             bundle.articles,
             bundle.runs,
+            import_portable_settings=bool(
+                getattr(_value, "import_portable_settings", False)
+            ),
         )
         warning: str | None = None
         run_id = result.get("latest_imported_run_id") or result.get("run_id")
@@ -818,6 +883,18 @@ def create_app(
         return {
             "applied": True,
             "summary": summary,
+            "portable_settings": {
+                "requested": result["portable_settings_requested"],
+                "applied": result["portable_settings_applied"],
+                "changed_fields": result["portable_settings_changed"],
+                "excluded_fields": [
+                    "onboarding_completed",
+                    "deepseek_status",
+                    "deepseek_last_tested_at",
+                    "deepseek_last_error",
+                    "deepseek_api_key",
+                ],
+            },
             "automatic_backup": automatic_backup.name,
             "warning": warning,
         }

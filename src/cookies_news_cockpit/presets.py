@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-PRESET_CATALOG_VERSION = 1
+PRESET_CATALOG_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +167,82 @@ SOURCE_PRESETS: tuple[SourcePreset, ...] = (
         "policy",
         "en",
         "https://www.un.org/en/about-us/copyright",
+    ),
+    # Catalog v2: these HTTPS RSS feeds were parsed with the same user agent and
+    # response-size limits as the app on 2026-09-10.  They stay disabled when
+    # merged into an existing installation, so an upgrade never broadens a
+    # user's source scope without an explicit choice.
+    SourcePreset(
+        "preset-sec-press-releases",
+        "SEC · Press Releases",
+        "https://www.sec.gov/news/pressreleases.rss",
+        "https://www.sec.gov/newsroom/press-releases",
+        "policy",
+        "en",
+        "https://www.sec.gov/about/privacy-information",
+    ),
+    SourcePreset(
+        "preset-sec-speeches-statements",
+        "SEC · Speeches & Statements",
+        "https://www.sec.gov/news/speeches-statements.rss",
+        "https://www.sec.gov/newsroom/speeches-statements",
+        "policy",
+        "en",
+        "https://www.sec.gov/about/privacy-information",
+    ),
+    SourcePreset(
+        "preset-eu-environment-news",
+        "European Commission · Environment News",
+        "https://environment.ec.europa.eu/node/92/rss_en",
+        "https://environment.ec.europa.eu/news_en",
+        "policy",
+        "en",
+        "https://commission.europa.eu/legal-notice_en",
+    ),
+    SourcePreset(
+        "preset-eu-trade-news",
+        "European Commission · Trade News",
+        "https://policy.trade.ec.europa.eu/node/2/rss_en",
+        "https://policy.trade.ec.europa.eu/news_en",
+        "policy",
+        "en",
+        "https://commission.europa.eu/legal-notice_en",
+    ),
+    SourcePreset(
+        "preset-bis-media-releases",
+        "BIS · Media Releases",
+        "https://www.bis.org/doclist/all_pressrels.rss",
+        "https://www.bis.org/media/news",
+        "business",
+        "en",
+        "https://www.bis.org/about/terms-conditions",
+    ),
+    SourcePreset(
+        "preset-nasa-news-releases",
+        "NASA · News Releases",
+        "https://www.nasa.gov/news-release/feed/",
+        "https://www.nasa.gov/news-release/",
+        "science",
+        "en",
+        "https://www.nasa.gov/privacy/",
+    ),
+    SourcePreset(
+        "preset-nasa-technology",
+        "NASA · Technology",
+        "https://www.nasa.gov/technology/feed/",
+        "https://www.nasa.gov/technology/",
+        "technology",
+        "en",
+        "https://www.nasa.gov/privacy/",
+    ),
+    SourcePreset(
+        "preset-techcrunch",
+        "TechCrunch",
+        "https://techcrunch.com/feed/",
+        "https://techcrunch.com/",
+        "technology",
+        "en",
+        "https://techcrunch.com/terms-of-service/",
     ),
 )
 

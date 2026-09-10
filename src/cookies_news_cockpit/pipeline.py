@@ -25,10 +25,17 @@ from .storage import Database, NotFoundError, utc_now, validate_run_id_token
 ANALYSIS_BREAKER = 500
 FULLTEXT_SHORTLIST_MAX = 100
 ZERO_HIT_REVIEW_MAX = 20
+SEMANTIC_EXPANSION_MAX = 15
 FUTURE_TOLERANCE = timedelta(days=1)
 LOGGER = logging.getLogger(__name__)
 
 FUNNEL_COUNTERS = (
+    # 1.2 stage totals.  The 1.1 keys below remain intact for old clients and
+    # imported run artifacts.
+    "discovered",
+    "processed",
+    "results",
+    "unique_candidates",
     "feed_items",
     "fresh",
     "date_rejected",
@@ -39,16 +46,51 @@ FUNNEL_COUNTERS = (
     "keyword_hits",
     "exclusion_rejected",
     "fulltext_fetches",
+    "fulltext_success",
+    "fulltext_failure",
+    "fulltext_keyword_hits",
+    "fulltext_recovery_budget_exhausted",
     "duplicates_skipped",
+    "history_duplicates",
+    "run_duplicates",
+    "semantic_candidates",
+    "semantic_reviewed",
+    "semantic_initial_reviewed",
+    "semantic_additional_reviewed",
     "semantic_fallback",
+    "semantic_expansion",
+    "semantic_budget_exhausted",
+    "budget_exhausted",
     "ai_candidates",
     "ai_requests",
     "ai_success",
     "ai_failure",
     "ai_cache_hits",
+    "ai_irrelevant",
+    "reason_direct_match",
+    "reason_contextual_match",
+    "reason_background_context",
+    "reason_off_topic",
+    "reason_exclusion_match",
+    "reason_insufficient_evidence",
+    "reason_other",
     "threshold_rejected",
+    "below_supplement",
+    "below_extended",
+    "core_selected",
+    "supplement_selected",
+    "extended_selected",
     "selected",
 )
+
+RELEVANCE_REASON_COUNTERS = {
+    "direct_match": "reason_direct_match",
+    "contextual_match": "reason_contextual_match",
+    "background_context": "reason_background_context",
+    "off_topic": "reason_off_topic",
+    "exclusion_match": "reason_exclusion_match",
+    "insufficient_evidence": "reason_insufficient_evidence",
+}
 
 
 def _content_hash(article: FeedArticle) -> str:
@@ -189,6 +231,24 @@ class _Ranked:
     analysis: str
     analysis_mode: str
     model: str | None
+    selection_tier: str
+    relevance_reason: str
+
+
+@dataclass(slots=True)
+class _TopicWork:
+    topic: dict[str, Any]
+    threshold: int
+    supplement_threshold: int
+    limit: int
+    source_order: list[str]
+    direct_candidates: list[_Candidate]
+    semantic_candidates: list[_Candidate]
+    prepared_semantic_candidates: list[_Candidate]
+    ranked: list[_Ranked]
+    direct_position: int = 0
+    semantic_position: int = 0
+    semantic_review_position: int = 0
 
 
 class RunConflictError(RuntimeError):
@@ -324,6 +384,29 @@ class RunManager:
                 break
         return selected
 
+    @classmethod
+    def _round_robin_candidates(
+        cls,
+        candidates: list[_Candidate],
+        source_order: list[str],
+    ) -> list[_Candidate]:
+        """Keep every candidate while alternating its configured sources."""
+
+        by_identity: dict[tuple[str, str], list[_Candidate]] = {}
+        articles: list[FeedArticle] = []
+        for candidate in candidates:
+            identity = (canonical_url(candidate.article.url), candidate.article.title)
+            by_identity.setdefault(identity, []).append(candidate)
+            articles.append(candidate.article)
+        ordered_articles = cls._round_robin_latest(articles, source_order, len(articles))
+        ordered: list[_Candidate] = []
+        for article in ordered_articles:
+            identity = (canonical_url(article.url), article.title)
+            matches = by_identity.get(identity)
+            if matches:
+                ordered.append(matches.pop(0))
+        return ordered
+
     @staticmethod
     def _deduplicate_candidates(
         candidates: list[_Candidate],
@@ -350,13 +433,20 @@ class RunManager:
         for candidate in ordered:
             article = candidate.article
             digest = _content_hash(article)
-            duplicate = digest in seen_hashes
-            duplicate = duplicate or duplicate_index.is_duplicate(article.url, article.title)
-            duplicate = duplicate or topic_index.is_duplicate(article.url, article.title)
-            if duplicate:
+            history_duplicate = duplicate_index.is_duplicate(article.url, article.title)
+            run_duplicate = digest in seen_hashes or topic_index.is_duplicate(
+                article.url, article.title
+            )
+            if history_duplicate or run_duplicate:
                 _bump(
                     funnel,
                     "duplicates_skipped",
+                    topic_id=topic_id,
+                    source_id=article.source_id,
+                )
+                _bump(
+                    funnel,
+                    "history_duplicates" if history_duplicate else "run_duplicates",
                     topic_id=topic_id,
                     source_id=article.source_id,
                 )
@@ -450,6 +540,7 @@ class RunManager:
                     items = await self._fetch_metadata(source)
                     fetched[source["id"]] = items
                     _bump(funnel, "feed_items", len(items), source_id=source["id"])
+                    _bump(funnel, "discovered", len(items), source_id=source["id"])
                     fresh_items: list[FeedArticle] = []
                     source_date_rejections = {
                         "date_missing": 0,
@@ -516,15 +607,19 @@ class RunManager:
             ai_client = self.deepseek_factory(api_key) if api_key else None
             ai_live = ai_client is not None
             ai_connection_confirmed = False
-            semantic_remaining = min(20, settings.semantic_fallback_limit)
+            semantic_initial_budget = min(
+                ZERO_HIT_REVIEW_MAX, settings.semantic_fallback_limit
+            )
             self.db.update_run(run_id, phase="filtering", funnel=funnel)
 
+            topic_work: list[_TopicWork] = []
             for topic in topics:
                 threshold = (
                     topic["threshold"]
                     if topic["threshold"] is not None
                     else settings.default_threshold
                 )
+                supplement_threshold = min(threshold, max(40, threshold - 15))
                 limit = (
                     run_article_limit or topic["article_limit"] or settings.default_article_limit
                 )
@@ -539,6 +634,13 @@ class RunManager:
                 _bump(
                     funnel,
                     "feed_items",
+                    topic_feed_items,
+                    topic_id=topic["id"],
+                    total=False,
+                )
+                _bump(
+                    funnel,
+                    "discovered",
                     topic_feed_items,
                     topic_id=topic["id"],
                     total=False,
@@ -574,6 +676,10 @@ class RunManager:
                         topic_id=topic["id"],
                         total=False,
                     )
+                topic_funnel = funnel["per_topic"][topic["id"]]
+                topic_funnel["core_threshold"] = threshold
+                topic_funnel["supplement_threshold"] = supplement_threshold
+                topic_funnel["target_count"] = limit
                 keywords = topic["keywords"] or [topic["name"]]
                 exclusions = topic.get("exclusion_keywords", [])
                 initial_candidates: list[_Candidate] = []
@@ -601,400 +707,657 @@ class RunManager:
                             )
                         else:
                             unmatched.append(article)
-
-                candidates: list[_Candidate]
-                if initial_candidates:
-                    candidates = self._deduplicate_candidates(
-                        initial_candidates, duplicate_index, funnel, topic["id"]
-                    )
-                    shortlist = min(FULLTEXT_SHORTLIST_MAX, max(20, limit * 3))
-                    refreshed: list[_Candidate] = []
-                    for position, candidate in enumerate(candidates):
-                        article = candidate.article
-                        if settings.extract_full_text and position < shortlist:
-                            article, attempted = await self._enrich_full_text(article)
-                            if attempted:
-                                _bump(
-                                    funnel,
-                                    "fulltext_fetches",
-                                    topic_id=topic["id"],
-                                    source_id=article.source_id,
-                                )
-                            evidence = match_article(article, keywords, exclusions)
-                            if evidence.excluded_keywords:
-                                _bump(
-                                    funnel,
-                                    "exclusion_rejected",
-                                    topic_id=topic["id"],
-                                    source_id=article.source_id,
-                                )
-                                continue
-                            candidate = _Candidate(
-                                article,
-                                evidence,
-                                _keyword_score(evidence),
-                            )
-                        refreshed.append(candidate)
-                    recovered: list[_Candidate] = []
-                    if settings.extract_full_text and unmatched:
-                        review_order = self._round_robin_latest(
-                            unmatched,
-                            source_order,
-                            len(unmatched),
-                        )
-                        review_candidates = [
-                            _Candidate(
-                                article,
-                                match_article(article, keywords, exclusions),
-                                0,
-                            )
-                            for article in review_order
-                        ]
-                        review_candidates = self._deduplicate_candidates(
-                            review_candidates,
-                            duplicate_index,
-                            funnel,
-                            topic["id"],
-                            preserve_order=True,
-                        )[:ZERO_HIT_REVIEW_MAX]
-                        for candidate in review_candidates:
-                            article, attempted = await self._enrich_full_text(
-                                candidate.article
-                            )
-                            if attempted:
-                                _bump(
-                                    funnel,
-                                    "fulltext_fetches",
-                                    topic_id=topic["id"],
-                                    source_id=article.source_id,
-                                )
-                            evidence = match_article(article, keywords, exclusions)
-                            if evidence.excluded_keywords:
-                                _bump(
-                                    funnel,
-                                    "exclusion_rejected",
-                                    topic_id=topic["id"],
-                                    source_id=article.source_id,
-                                )
-                                continue
-                            if evidence.matched:
-                                _bump(
-                                    funnel,
-                                    "keyword_hits",
-                                    topic_id=topic["id"],
-                                    source_id=article.source_id,
-                                )
-                                recovered.append(
-                                    _Candidate(article, evidence, _keyword_score(evidence))
-                                )
-                    candidates = self._deduplicate_candidates(
-                        [*refreshed, *recovered],
-                        duplicate_index,
-                        funnel,
-                        topic["id"],
-                    )
-                    post_dedup_candidates += len(candidates)
-                else:
-                    review_order = self._round_robin_latest(
-                        unmatched,
-                        source_order,
-                        len(unmatched),
-                    )
-                    review_candidates = [
+                direct_candidates = self._deduplicate_candidates(
+                    initial_candidates, duplicate_index, funnel, topic["id"]
+                )
+                review_order = self._round_robin_latest(
+                    unmatched,
+                    source_order,
+                    len(unmatched),
+                )
+                semantic_candidates = self._deduplicate_candidates(
+                    [
                         _Candidate(
                             article,
                             match_article(article, keywords, exclusions),
                             0,
+                            True,
                         )
                         for article in review_order
-                    ]
-                    review_candidates = self._deduplicate_candidates(
-                        review_candidates,
-                        duplicate_index,
+                    ],
+                    duplicate_index,
+                    funnel,
+                    topic["id"],
+                    preserve_order=True,
+                )
+                unique_count = len(direct_candidates) + len(semantic_candidates)
+                post_dedup_candidates += unique_count
+                for candidate in (*direct_candidates, *semantic_candidates):
+                    _bump(
                         funnel,
-                        topic["id"],
-                        preserve_order=True,
-                    )[:ZERO_HIT_REVIEW_MAX]
-                    post_dedup_candidates += len(review_candidates)
-                    fulltext_matches: list[_Candidate] = []
-                    semantic_pool: list[_Candidate] = []
-                    for candidate in review_candidates:
-                        article = candidate.article
-                        if settings.extract_full_text:
-                            article, attempted = await self._enrich_full_text(article)
-                            if attempted:
-                                _bump(
-                                    funnel,
-                                    "fulltext_fetches",
-                                    topic_id=topic["id"],
-                                    source_id=article.source_id,
-                                )
-                        evidence = match_article(article, keywords, exclusions)
-                        if evidence.excluded_keywords:
+                        "unique_candidates",
+                        topic_id=topic["id"],
+                        source_id=candidate.article.source_id,
+                    )
+                direct_review_limit = min(FULLTEXT_SHORTLIST_MAX, max(20, limit * 3))
+                topic_work.append(
+                    _TopicWork(
+                        topic=topic,
+                        threshold=threshold,
+                        supplement_threshold=supplement_threshold,
+                        limit=limit,
+                        source_order=source_order,
+                        direct_candidates=self._round_robin_candidates(
+                            direct_candidates, source_order
+                        )[:direct_review_limit],
+                        semantic_candidates=semantic_candidates,
+                        prepared_semantic_candidates=[],
+                        ranked=[],
+                    )
+                )
+
+            fulltext_attempt_count = 0
+            # A fetched article can be bound to several topics.  Cache even an
+            # empty/failed extraction so one URL consumes at most one real
+            # network attempt and one slot from the run-wide safety cap.
+            fulltext_by_url: dict[str, tuple[str, bool]] = {}
+
+            async def prepare_candidate(
+                work: _TopicWork, candidate: _Candidate
+            ) -> _Candidate | None:
+                nonlocal fulltext_attempt_count
+
+                article = candidate.article
+                _bump(
+                    funnel,
+                    "processed",
+                    topic_id=work.topic["id"],
+                    source_id=article.source_id,
+                )
+                if settings.extract_full_text and not article.full_text:
+                    fulltext_key = canonical_url(article.url) or article.url
+                    cached_fulltext = fulltext_by_url.get(fulltext_key)
+                    if cached_fulltext is not None:
+                        full_text, attempted = cached_fulltext
+                        article = article.model_copy(update={"full_text": full_text})
+                        if attempted:
+                            # Global/source totals describe real network work;
+                            # the topic still records that full text was
+                            # available (or unavailable) for its own matching.
                             _bump(
                                 funnel,
-                                "exclusion_rejected",
-                                topic_id=topic["id"],
+                                "fulltext_success" if full_text.strip() else "fulltext_failure",
+                                topic_id=work.topic["id"],
+                                total=False,
+                            )
+                    elif fulltext_attempt_count < FULLTEXT_SHORTLIST_MAX:
+                        article, attempted = await self._enrich_full_text(article)
+                        fulltext_by_url[fulltext_key] = (article.full_text, attempted)
+                        if attempted:
+                            fulltext_attempt_count += 1
+                            _bump(
+                                funnel,
+                                "fulltext_fetches",
+                                topic_id=work.topic["id"],
                                 source_id=article.source_id,
                             )
-                            continue
-                        if evidence.matched:
                             _bump(
                                 funnel,
-                                "keyword_hits",
-                                topic_id=topic["id"],
+                                (
+                                    "fulltext_success"
+                                    if article.full_text.strip()
+                                    else "fulltext_failure"
+                                ),
+                                topic_id=work.topic["id"],
                                 source_id=article.source_id,
-                            )
-                            fulltext_matches.append(
-                                _Candidate(article, evidence, _keyword_score(evidence))
-                            )
-                        else:
-                            semantic_pool.append(_Candidate(article, evidence, 0, True))
-                    if fulltext_matches:
-                        candidates = fulltext_matches
-                    elif (
-                        api_key
-                        and settings.semantic_fallback_enabled
-                        and ai_live
-                        and semantic_remaining > 0
-                    ):
-                        candidates = semantic_pool[:semantic_remaining]
-                        semantic_remaining -= len(candidates)
-                        for candidate in candidates:
-                            _bump(
-                                funnel,
-                                "semantic_fallback",
-                                topic_id=topic["id"],
-                                source_id=candidate.article.source_id,
                             )
                     else:
-                        candidates = []
-
-                self.db.update_run(
-                    run_id,
-                    phase="analyzing",
-                    funnel=funnel,
-                    duplicates_skipped=funnel["duplicates_skipped"],
-                )
-                ranked: list[_Ranked] = []
-                semantic_config = {
-                    "name": topic["name"],
-                    "keywords": keywords,
-                    "exclusion_keywords": exclusions,
-                }
-                for candidate in candidates:
-                    article = candidate.article
-                    score = candidate.lexical_score
-                    summary = article.excerpt[:1000] or article.title
-                    analysis = (
-                        "DeepSeek 本次未生成分析；已使用关键词规则初筛。"
-                        if api_key
-                        else "关键词规则初筛；未配置 DeepSeek API Key，本次未调用 AI。"
+                        fulltext_by_url[fulltext_key] = (article.full_text, False)
+                        _bump(
+                            funnel,
+                            "fulltext_recovery_budget_exhausted",
+                            topic_id=work.topic["id"],
+                            source_id=article.source_id,
+                        )
+                keywords = work.topic["keywords"] or [work.topic["name"]]
+                exclusions = work.topic.get("exclusion_keywords", [])
+                evidence = match_article(article, keywords, exclusions)
+                if evidence.excluded_keywords:
+                    _bump(
+                        funnel,
+                        "exclusion_rejected",
+                        topic_id=work.topic["id"],
+                        source_id=article.source_id,
                     )
-                    analysis_mode = "rules_fallback" if api_key else "rules"
-                    model: str | None = None
-                    ai_result: AIAnalysis | None = None
-                    fingerprint = _analysis_fingerprint(article)
-                    cached: dict[str, Any] | None = None
-                    if api_key and hasattr(self.db, "get_ai_cache"):
-                        try:
-                            cached = self.db.get_ai_cache(
-                                fingerprint, semantic_config, DEEPSEEK_MODEL
-                            )
-                        except Exception:
-                            LOGGER.exception("Could not read DeepSeek analysis cache")
-                    if cached is not None:
-                        try:
-                            ai_result = AIAnalysis.model_validate(cached)
-                        except ValueError:
-                            ai_result = None
-                        else:
+                    _bump(
+                        funnel,
+                        "reason_exclusion_match",
+                        topic_id=work.topic["id"],
+                        source_id=article.source_id,
+                    )
+                    return None
+                if evidence.matched and not candidate.evidence.matched:
+                    _bump(
+                        funnel,
+                        "keyword_hits",
+                        topic_id=work.topic["id"],
+                        source_id=article.source_id,
+                    )
+                    _bump(
+                        funnel,
+                        "fulltext_keyword_hits",
+                        topic_id=work.topic["id"],
+                        source_id=article.source_id,
+                    )
+                return _Candidate(
+                    article,
+                    evidence,
+                    _keyword_score(evidence) if evidence.matched else 0,
+                    not evidence.matched,
+                )
+
+            def bump_reason(work: _TopicWork, article: FeedArticle, reason: str) -> str:
+                normalized = str(reason or "").strip().casefold()
+                counter = RELEVANCE_REASON_COUNTERS.get(normalized, "reason_other")
+                _bump(
+                    funnel,
+                    counter,
+                    topic_id=work.topic["id"],
+                    source_id=article.source_id,
+                )
+                return normalized or "direct_match"
+
+            async def analyze_candidate(
+                work: _TopicWork,
+                candidate: _Candidate,
+                *,
+                semantic_stage: str | None = None,
+            ) -> bool:
+                nonlocal analysis_count, ai_connection_confirmed, ai_failed
+                nonlocal ai_failure, ai_live, ai_success, breaker_hit
+
+                article = candidate.article
+                if candidate.semantic and (
+                    not api_key or not settings.semantic_fallback_enabled
+                ):
+                    return False
+                score = candidate.lexical_score
+                summary = article.excerpt[:1000] or article.title
+                analysis = (
+                    "DeepSeek 本次未生成分析；已使用关键词规则初筛。"
+                    if api_key
+                    else "关键词规则初筛；未配置 DeepSeek API Key，本次未调用 AI。"
+                )
+                analysis_mode = "rules_fallback" if api_key else "rules"
+                model: str | None = None
+                ai_result: AIAnalysis | None = None
+                semantic_counted = False
+
+                def mark_semantic_review() -> None:
+                    nonlocal semantic_counted
+                    if semantic_counted or not candidate.semantic:
+                        return
+                    semantic_counted = True
+                    for key in ("semantic_reviewed", "semantic_fallback"):
+                        _bump(
+                            funnel,
+                            key,
+                            topic_id=work.topic["id"],
+                            source_id=article.source_id,
+                        )
+                    if semantic_stage == "additional":
+                        for key in ("semantic_additional_reviewed", "semantic_expansion"):
                             _bump(
                                 funnel,
-                                "ai_candidates",
-                                topic_id=topic["id"],
+                                key,
+                                topic_id=work.topic["id"],
                                 source_id=article.source_id,
                             )
-                            _bump(
-                                funnel,
-                                "ai_success",
-                                topic_id=topic["id"],
-                                source_id=article.source_id,
-                            )
-                            _bump(
-                                funnel,
-                                "ai_cache_hits",
-                                topic_id=topic["id"],
-                                source_id=article.source_id,
-                            )
-                            ai_success += 1
-                            analysis_mode = (
-                                "ai_cache_semantic" if candidate.semantic else "ai_cache"
-                            )
-                            model = DEEPSEEK_MODEL
-                    if ai_result is None and ai_live and analysis_count < ANALYSIS_BREAKER:
+                    else:
+                        _bump(
+                            funnel,
+                            "semantic_initial_reviewed",
+                            topic_id=work.topic["id"],
+                            source_id=article.source_id,
+                        )
+
+                semantic_config = {
+                    "name": work.topic["name"],
+                    "keywords": work.topic["keywords"] or [work.topic["name"]],
+                    "exclusion_keywords": work.topic.get("exclusion_keywords", []),
+                    "scoring_policy_version": 2,
+                }
+                fingerprint = _analysis_fingerprint(article)
+                cached: dict[str, Any] | None = None
+                if api_key and hasattr(self.db, "get_ai_cache"):
+                    try:
+                        cached = self.db.get_ai_cache(
+                            fingerprint, semantic_config, DEEPSEEK_MODEL
+                        )
+                    except Exception:
+                        LOGGER.exception("Could not read DeepSeek analysis cache")
+                if cached is not None:
+                    try:
+                        ai_result = AIAnalysis.model_validate(cached)
+                    except ValueError:
+                        ai_result = None
+                    else:
+                        mark_semantic_review()
                         _bump(
                             funnel,
                             "ai_candidates",
-                            topic_id=topic["id"],
+                            topic_id=work.topic["id"],
                             source_id=article.source_id,
                         )
-                        analysis_count += 1
-                        before_requests = getattr(ai_client, "http_request_count", None)
-                        request_fallback = 1
-                        try:
-                            raw_result = await ai_client.analyze(article, topic)
-                            ai_result = AIAnalysis.model_validate(raw_result)
-                            if not ai_connection_confirmed:
-                                self._record_deepseek_status(
-                                    "connected",
-                                    error=None,
-                                    tested=True,
-                                )
-                                ai_connection_confirmed = True
-                            _bump(
-                                funnel,
-                                "ai_success",
-                                topic_id=topic["id"],
-                                source_id=article.source_id,
-                            )
-                            ai_success += 1
-                            analysis_mode = "ai_semantic" if candidate.semantic else "ai"
-                            model = DEEPSEEK_MODEL
-                            if hasattr(self.db, "put_ai_cache"):
-                                try:
-                                    self.db.put_ai_cache(
-                                        fingerprint,
-                                        semantic_config,
-                                        DEEPSEEK_MODEL,
-                                        ai_result.model_dump(mode="json"),
-                                        ttl_days=7,
-                                    )
-                                except Exception:
-                                    LOGGER.exception("Could not write DeepSeek analysis cache")
-                        except DeepSeekError as exc:
-                            ai_failed = True
-                            ai_live = False
-                            ai_failure += 1
-                            self._record_deepseek_status(
-                                "error",
-                                error=str(exc),
-                                tested=True,
-                            )
-                            request_fallback = max(1, exc.http_requests)
-                            _bump(
-                                funnel,
-                                "ai_failure",
-                                topic_id=topic["id"],
-                                source_id=article.source_id,
-                            )
-                            warning_parts.append(
-                                f"{str(exc)[:220]} 本次剩余候选已停止 AI 调用并回退规则初筛。"
-                            )
-                        finally:
-                            after_requests = getattr(ai_client, "http_request_count", None)
-                            if isinstance(before_requests, int) and isinstance(after_requests, int):
-                                request_count = max(0, after_requests - before_requests)
-                            else:
-                                request_count = request_fallback
-                            _bump(
-                                funnel,
-                                "ai_requests",
-                                request_count,
-                                topic_id=topic["id"],
-                                source_id=article.source_id,
-                            )
-                    elif ai_result is None and ai_live and analysis_count >= ANALYSIS_BREAKER:
-                        breaker_hit = True
-                        if not candidate.semantic:
-                            analysis = "已达到单次 AI 分析安全上限；使用关键词规则初筛。"
-
-                    if ai_result is not None:
-                        score = ai_result.score
-                        summary = ai_result.summary
-                        analysis = ai_result.analysis
-                    elif candidate.semantic:
-                        # A zero-keyword semantic candidate is never promoted
-                        # by a fabricated lexical score when AI is unavailable.
-                        continue
-                    if score < threshold:
                         _bump(
                             funnel,
-                            "threshold_rejected",
-                            topic_id=topic["id"],
+                            "ai_success",
+                            topic_id=work.topic["id"],
                             source_id=article.source_id,
                         )
-                        continue
-                    ranked.append(
-                        _Ranked(
-                            candidate,
-                            score,
-                            summary,
-                            analysis,
-                            analysis_mode,
-                            model,
+                        _bump(
+                            funnel,
+                            "ai_cache_hits",
+                            topic_id=work.topic["id"],
+                            source_id=article.source_id,
                         )
+                        ai_success += 1
+                        analysis_mode = (
+                            "ai_cache_semantic" if candidate.semantic else "ai_cache"
+                        )
+                        model = DEEPSEEK_MODEL
+                if ai_result is None and ai_live and analysis_count < ANALYSIS_BREAKER:
+                    mark_semantic_review()
+                    _bump(
+                        funnel,
+                        "ai_candidates",
+                        topic_id=work.topic["id"],
+                        source_id=article.source_id,
                     )
+                    analysis_count += 1
+                    before_requests = getattr(ai_client, "http_request_count", None)
+                    request_fallback = 1
+                    try:
+                        raw_result = await ai_client.analyze(article, work.topic)
+                        ai_result = AIAnalysis.model_validate(raw_result)
+                        if not ai_connection_confirmed:
+                            self._record_deepseek_status(
+                                "connected",
+                                error=None,
+                                tested=True,
+                            )
+                            ai_connection_confirmed = True
+                        _bump(
+                            funnel,
+                            "ai_success",
+                            topic_id=work.topic["id"],
+                            source_id=article.source_id,
+                        )
+                        ai_success += 1
+                        analysis_mode = "ai_semantic" if candidate.semantic else "ai"
+                        model = DEEPSEEK_MODEL
+                        if hasattr(self.db, "put_ai_cache"):
+                            try:
+                                self.db.put_ai_cache(
+                                    fingerprint,
+                                    semantic_config,
+                                    DEEPSEEK_MODEL,
+                                    ai_result.model_dump(mode="json"),
+                                    ttl_days=7,
+                                )
+                            except Exception:
+                                LOGGER.exception("Could not write DeepSeek analysis cache")
+                    except DeepSeekError as exc:
+                        ai_failed = True
+                        ai_live = False
+                        ai_failure += 1
+                        self._record_deepseek_status(
+                            "error",
+                            error=str(exc),
+                            tested=True,
+                        )
+                        request_fallback = max(1, exc.http_requests)
+                        _bump(
+                            funnel,
+                            "ai_failure",
+                            topic_id=work.topic["id"],
+                            source_id=article.source_id,
+                        )
+                        warning_parts.append(
+                            f"{str(exc)[:220]} 本次剩余候选已停止 AI 调用并回退规则初筛。"
+                        )
+                    finally:
+                        after_requests = getattr(ai_client, "http_request_count", None)
+                        if isinstance(before_requests, int) and isinstance(after_requests, int):
+                            request_count = max(0, after_requests - before_requests)
+                        else:
+                            request_count = request_fallback
+                        _bump(
+                            funnel,
+                            "ai_requests",
+                            request_count,
+                            topic_id=work.topic["id"],
+                            source_id=article.source_id,
+                        )
+                elif ai_result is None and ai_live and analysis_count >= ANALYSIS_BREAKER:
+                    breaker_hit = True
+                    if not candidate.semantic:
+                        analysis = "已达到单次 AI 分析安全上限；使用关键词规则初筛。"
 
-                ranked.sort(
+                relevance_reason = "direct_match"
+                if ai_result is not None:
+                    score = ai_result.score
+                    summary = ai_result.summary
+                    analysis = ai_result.analysis
+                    relevance_reason = bump_reason(
+                        work, article, getattr(ai_result, "reason", "direct_match")
+                    )
+                    if not bool(getattr(ai_result, "relevant", True)):
+                        _bump(
+                            funnel,
+                            "ai_irrelevant",
+                            topic_id=work.topic["id"],
+                            source_id=article.source_id,
+                        )
+                        return semantic_counted
+                elif candidate.semantic:
+                    # A non-literal candidate is never promoted by a fabricated
+                    # lexical score when AI is absent, disabled, or unhealthy.
+                    return semantic_counted
+                else:
+                    bump_reason(work, article, relevance_reason)
+
+                if score < work.supplement_threshold:
+                    for key in (
+                        "threshold_rejected",
+                        "below_supplement",
+                        "below_extended",
+                    ):
+                        _bump(
+                            funnel,
+                            key,
+                            topic_id=work.topic["id"],
+                            source_id=article.source_id,
+                        )
+                    return semantic_counted
+                selection_tier = "core" if score >= work.threshold else "supplement"
+                work.ranked.append(
+                    _Ranked(
+                        candidate,
+                        score,
+                        summary,
+                        analysis,
+                        analysis_mode,
+                        model,
+                        selection_tier,
+                        relevance_reason,
+                    )
+                )
+                return semantic_counted
+
+            def build_selection_plan(
+                *, record_run_duplicates: bool = False
+            ) -> tuple[list[tuple[_TopicWork, _Ranked]], dict[str, int]]:
+                ranked_by_topic = {
+                    work.topic["id"]: sorted(
+                        work.ranked,
+                        key=lambda item: (
+                            -item.score,
+                            -_published_rank(item.candidate.article.published_at),
+                        ),
+                    )
+                    for work in topic_work
+                }
+                positions = {work.topic["id"]: 0 for work in topic_work}
+                counts = {work.topic["id"]: 0 for work in topic_work}
+                run_index = DuplicateIndex()
+                plan: list[tuple[_TopicWork, _Ranked]] = []
+                while True:
+                    progressed = False
+                    for work in topic_work:
+                        topic_id = work.topic["id"]
+                        if counts[topic_id] >= work.limit:
+                            continue
+                        ranked = ranked_by_topic[topic_id]
+                        position = positions[topic_id]
+                        while position < len(ranked):
+                            item = ranked[position]
+                            position += 1
+                            positions[topic_id] = position
+                            article = item.candidate.article
+                            if run_index.is_duplicate(article.url, article.title):
+                                if record_run_duplicates:
+                                    _bump(
+                                        funnel,
+                                        "duplicates_skipped",
+                                        topic_id=topic_id,
+                                        source_id=article.source_id,
+                                    )
+                                    _bump(
+                                        funnel,
+                                        "run_duplicates",
+                                        topic_id=topic_id,
+                                        source_id=article.source_id,
+                                    )
+                                continue
+                            plan.append((work, item))
+                            counts[topic_id] += 1
+                            run_index.add(article.url, article.title)
+                            progressed = True
+                            break
+                    if not progressed:
+                        break
+                return plan, counts
+
+            async def analyze_direct_fairly() -> None:
+                while True:
+                    progressed = False
+                    for work in topic_work:
+                        _plan, provisional_counts = build_selection_plan()
+                        if provisional_counts[work.topic["id"]] >= work.limit:
+                            continue
+                        if work.direct_position >= len(work.direct_candidates):
+                            continue
+                        candidate = work.direct_candidates[work.direct_position]
+                        work.direct_position += 1
+                        progressed = True
+                        prepared = await prepare_candidate(work, candidate)
+                        if prepared is not None:
+                            await analyze_candidate(work, prepared)
+                    if not progressed:
+                        return
+
+            async def prepare_unmatched_fairly() -> None:
+                """Build the semantic pool after bounded, fair full-text recovery.
+
+                Full-text attempts have their own global cap in
+                ``prepare_candidate``.  Reaching that cap does not stop this
+                pass: the remaining metadata-only candidates are still added
+                to the semantic pool, so the 20+15 AI budget remains usable.
+                """
+
+                while True:
+                    progressed = False
+                    for work in topic_work:
+                        _plan, provisional_counts = build_selection_plan()
+                        if provisional_counts[work.topic["id"]] >= work.limit:
+                            continue
+                        if work.semantic_position >= len(work.semantic_candidates):
+                            continue
+                        candidate = work.semantic_candidates[work.semantic_position]
+                        work.semantic_position += 1
+                        progressed = True
+                        prepared = await prepare_candidate(work, candidate)
+                        if prepared is None:
+                            continue
+                        if prepared.semantic:
+                            _bump(
+                                funnel,
+                                "semantic_candidates",
+                                topic_id=work.topic["id"],
+                                source_id=prepared.article.source_id,
+                            )
+                            work.prepared_semantic_candidates.append(prepared)
+                        else:
+                            await analyze_candidate(work, prepared)
+                    if not progressed:
+                        return
+
+            async def analyze_semantic_fairly(
+                budget: int, *, stage: str
+            ) -> int:
+                used = 0
+                while used < budget:
+                    progressed = False
+                    for work in topic_work:
+                        if used >= budget:
+                            break
+                        _plan, provisional_counts = build_selection_plan()
+                        if provisional_counts[work.topic["id"]] >= work.limit:
+                            continue
+                        if work.semantic_review_position >= len(
+                            work.prepared_semantic_candidates
+                        ):
+                            continue
+                        candidate = work.prepared_semantic_candidates[
+                            work.semantic_review_position
+                        ]
+                        work.semantic_review_position += 1
+                        progressed = True
+                        reviewed = await analyze_candidate(
+                            work,
+                            candidate,
+                            semantic_stage=stage,
+                        )
+                        if reviewed:
+                            used += 1
+                    if not progressed:
+                        break
+                return used
+
+            self.db.update_run(
+                run_id,
+                phase="analyzing",
+                funnel=funnel,
+                duplicates_skipped=funnel["duplicates_skipped"],
+            )
+            await analyze_direct_fairly()
+            semantic_pass_enabled = bool(
+                settings.extract_full_text
+                or (api_key and settings.semantic_fallback_enabled)
+            )
+            if semantic_pass_enabled:
+                await prepare_unmatched_fairly()
+            semantic_initial_used = 0
+            semantic_additional_used = 0
+            if api_key and settings.semantic_fallback_enabled:
+                semantic_initial_used = await analyze_semantic_fairly(
+                    semantic_initial_budget, stage="initial"
+                )
+            _plan, provisional_counts = build_selection_plan()
+            still_short = api_key and settings.semantic_fallback_enabled and any(
+                provisional_counts[work.topic["id"]] < work.limit
+                and work.semantic_review_position
+                < len(work.prepared_semantic_candidates)
+                for work in topic_work
+            )
+            if still_short:
+                semantic_additional_used = await analyze_semantic_fairly(
+                    SEMANTIC_EXPANSION_MAX,
+                    stage="additional",
+                )
+
+            _plan, provisional_counts = build_selection_plan()
+            for work in topic_work:
+                remaining = (
+                    len(work.prepared_semantic_candidates)
+                    - work.semantic_review_position
+                )
+                budget_was_consumed = (
+                    semantic_initial_used + semantic_additional_used
+                    >= semantic_initial_budget + SEMANTIC_EXPANSION_MAX
+                )
+                if (
+                    api_key
+                    and settings.semantic_fallback_enabled
+                    and budget_was_consumed
+                    and remaining > 0
+                    and provisional_counts[work.topic["id"]] < work.limit
+                ):
+                    for key in ("semantic_budget_exhausted", "budget_exhausted"):
+                        _bump(
+                            funnel,
+                            key,
+                            remaining,
+                            topic_id=work.topic["id"],
+                        )
+                work.ranked.sort(
                     key=lambda item: (
                         -item.score,
                         -_published_rank(item.candidate.article.published_at),
                     )
                 )
-                topic_selected = 0
-                for item in ranked:
-                    if topic_selected >= limit:
-                        break
-                    article = item.candidate.article
-                    if duplicate_index.is_duplicate(article.url, article.title):
-                        _bump(
-                            funnel,
-                            "duplicates_skipped",
-                            topic_id=topic["id"],
-                            source_id=article.source_id,
-                        )
-                        continue
-                    pending_articles.append(
-                        {
-                            "run_id": run_id,
-                            "topic_id": topic["id"],
-                            "source_id": article.source_id,
-                            "title": article.title,
-                            "url": article.url,
-                            "excerpt": article.excerpt,
-                            "full_text": article.full_text,
-                            "summary": item.summary,
-                            "analysis": item.analysis,
-                            "score": item.score,
-                            "published_at": article.published_at,
-                            "content_hash": _content_hash(article),
-                            "analysis_mode": item.analysis_mode,
-                            "model": item.model,
-                            "matched_keywords": list(
-                                item.candidate.evidence.matched_keywords
-                            ),
-                            "matched_fields": list(item.candidate.evidence.matched_fields),
-                        }
-                    )
-                    topic_selected += 1
-                    duplicate_index.add(article.url, article.title)
+
+            selection_plan, _selected_counts = build_selection_plan(
+                record_run_duplicates=True
+            )
+            for work, item in selection_plan:
+                topic_id = work.topic["id"]
+                article = item.candidate.article
+                pending_articles.append(
+                    {
+                        "run_id": run_id,
+                        "topic_id": topic_id,
+                        "source_id": article.source_id,
+                        "title": article.title,
+                        "url": article.url,
+                        "excerpt": article.excerpt,
+                        "full_text": article.full_text,
+                        "summary": item.summary,
+                        "analysis": item.analysis,
+                        "score": item.score,
+                        "published_at": article.published_at,
+                        "content_hash": _content_hash(article),
+                        "analysis_mode": item.analysis_mode,
+                        "model": item.model,
+                        "matched_keywords": list(
+                            item.candidate.evidence.matched_keywords
+                        ),
+                        "matched_fields": list(item.candidate.evidence.matched_fields),
+                        "selection_tier": item.selection_tier,
+                        "relevance_reason": item.relevance_reason,
+                    }
+                )
+                for key in ("selected", "results"):
                     _bump(
                         funnel,
-                        "selected",
-                        topic_id=topic["id"],
+                        key,
+                        topic_id=topic_id,
                         source_id=article.source_id,
                     )
-                self.db.update_run(
-                    run_id,
-                    phase="analyzing",
-                    funnel=funnel,
-                    analyses=analysis_count,
-                    ai_requests=funnel["ai_requests"],
-                    ai_success=ai_success,
-                    ai_failure=ai_failure,
-                    duplicates_skipped=funnel["duplicates_skipped"],
+                tier_keys = (
+                    ("core_selected",)
+                    if item.selection_tier == "core"
+                    else ("supplement_selected", "extended_selected")
                 )
+                for key in tier_keys:
+                    _bump(
+                        funnel,
+                        key,
+                        topic_id=topic_id,
+                        source_id=article.source_id,
+                    )
+
+            self.db.update_run(
+                run_id,
+                phase="analyzing",
+                funnel=funnel,
+                analyses=analysis_count,
+                ai_requests=funnel["ai_requests"],
+                ai_success=ai_success,
+                ai_failure=ai_failure,
+                duplicates_skipped=funnel["duplicates_skipped"],
+            )
 
             if not api_key and any(fetched.values()) and not key_store_failed:
                 warning_parts.append(
@@ -1004,21 +1367,35 @@ class RunManager:
                 warning_parts.append(
                     "单次运行已达到 500 次 AI 分析安全上限，剩余候选仅做规则初筛。"
                 )
+            if funnel["semantic_budget_exhausted"] > 0:
+                warning_parts.append(
+                    "语义复核已达到本次预算；仍有候选未分析，结果不会通过自动降门槛硬凑。"
+                )
+            if funnel["fulltext_recovery_budget_exhausted"] > 0:
+                warning_parts.append(
+                    "全文提取已达到单次 100 次安全上限；其余候选仅使用标题与摘要继续复核。"
+                )
             if source_failure:
                 warning_parts.append(f"{source_failure} 个新闻源抓取失败。")
 
             stored_count = 0
             self.db.update_run(run_id, phase="persisting", funnel=funnel)
-            # No await occurs while committing the buffered selection, so a
-            # cancellation cannot leave a half-written report.
-            for article in pending_articles:
-                self.db.insert_article(article)
-                stored_count += 1
+            # One synchronous SQLite transaction commits the whole buffered
+            # selection (including FTS rows), so cancellation or persistence
+            # failure cannot expose a half-written report.
+            stored_count = len(self.db.insert_articles(pending_articles))
 
             if stored_count > 0:
                 outcome = "complete"
             elif funnel["feed_items"] == 0 or funnel["fresh"] == 0:
                 outcome = "no_fresh_articles"
+            elif (
+                funnel["keyword_hits"] > 0
+                and funnel["ai_success"] > 0
+                and funnel["ai_irrelevant"] == funnel["ai_success"]
+                and funnel["threshold_rejected"] == 0
+            ):
+                outcome = "no_relevant_after_ai"
             elif funnel["keyword_hits"] == 0 and funnel["semantic_fallback"] == 0:
                 outcome = "no_keyword_match"
             elif post_dedup_candidates == 0 and funnel["duplicates_skipped"] > 0:
@@ -1035,6 +1412,11 @@ class RunManager:
                 warning_parts.append(f"{window}没有可用文章；请检查来源日期或调整新鲜度。")
             elif outcome == "no_keyword_match":
                 warning_parts.append("近期文章未命中主题关键词，语义兜底也未产生可展示结果。")
+            elif outcome == "no_relevant_after_ai":
+                warning_parts.append(
+                    "关键词候选已找到，但通过 AI 相关性复核后没有可展示结果；"
+                    "可检查主题范围、关键词和排除词。"
+                )
             elif outcome == "below_threshold":
                 warning_parts.append("候选文章存在，但均低于当前门槛分数。")
             elif outcome == "no_new_after_dedup":
@@ -1080,11 +1462,32 @@ class RunManager:
         except asyncio.CancelledError:
             # Selections are buffered until the final synchronous commit, so
             # there are no run articles to expose or promote here.
-            funnel["selected"] = 0
+            for key in (
+                "selected",
+                "results",
+                "core_selected",
+                "supplement_selected",
+                "extended_selected",
+            ):
+                funnel[key] = 0
             for values in funnel.get("per_topic", {}).values():
-                values["selected"] = 0
+                for key in (
+                    "selected",
+                    "results",
+                    "core_selected",
+                    "supplement_selected",
+                    "extended_selected",
+                ):
+                    values[key] = 0
             for values in funnel.get("per_source", {}).values():
-                values["selected"] = 0
+                for key in (
+                    "selected",
+                    "results",
+                    "core_selected",
+                    "supplement_selected",
+                    "extended_selected",
+                ):
+                    values[key] = 0
             cancelled = self.db.update_run(
                 run_id,
                 status="cancelled",

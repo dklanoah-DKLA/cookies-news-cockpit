@@ -2,7 +2,7 @@
 
 一个独立于 Obsidian 的本地新闻驾驶舱。它在 Mac 上启动本地服务，并用默认浏览器打开白色 Cookie 主题界面；主题、关键词、门槛分数、条数与来源都由使用者自己配置。
 
-> 当前版本为 **1.1.0**，只面向 **Intel Mac（x86_64）+ macOS Sonoma 14 或更高版本**。已知目标机是 2019 款 Intel MacBook Air。Apple Silicon 暂不在本版支持范围内。
+> 当前版本为 **1.2.0**，只面向 **Intel Mac（x86_64）+ macOS Sonoma 14 或更高版本**。已知目标机是 2019 款 Intel MacBook Air。Apple Silicon 暂不在本版支持范围内。
 
 ## 它会带来什么
 
@@ -11,15 +11,40 @@
 - DeepSeek API Key 保存在 macOS“钥匙串访问”中，不随报告或配置导出。
 - 服务只监听本机回环地址，不对局域网开放。
 - 手动抓取为主；驾驶舱保持打开时可进行每小时刷新。
-- 首次打开可按类别选择一套中英文 RSS 来源；跳过向导时使用 4 个平衡来源。内置目录共 16 个来源，均为跨行业综合、国际、财经、科技、科学或公共机构资讯。
+- 首次打开可按类别选择一套中英文 RSS 来源；跳过向导时使用 4 个平衡来源。内置目录共 24 个来源；1.2 新增的 8 个官方/媒体预设默认关闭，升级不会擅自扩大原有抓取范围。
 - 主题词支持英文逗号、中文逗号、顿号、中英文分号和换行；普通空格会保留在词组中。
 - 默认只看最近 7 天，可切换为 1、3、7、14、30 天或不限日期；日期缺失的文章不会偷偷混入有限时间窗。
 - 默认审核近 7 天历史及本次候选，拦截同链接或高度相似标题；标题出现实质更新时允许再次入选。
-- DeepSeek 可生成“关键词扩展”草案，只有用户确认后才保存。当字面关键词零命中时，可对最多 20 条候选做受控语义兜底。
-- 1.1 使用 `deepseek-v4-flash` 的非思考模式完成结构化筛选、摘要与主题建议；模型名称会在驾驶舱中明确显示。
+- DeepSeek 可生成“关键词扩展”草案；建议不会自动改词，只有用户确认加入草稿并保存主题后才生效。
+- 当核心结果不足时，“智能补充”先复核最多 20 条候选，仍不足时最多再追加 15 条；不会自动降门槛硬凑数量。
+- 1.2 使用 `deepseek-v4-flash` 的非思考模式完成结构化筛选、摘要与主题建议；模型名称会在驾驶舱中明确显示。
 - DeepSeek 在重试后仍不可用时，本次剩余候选会停止 AI 调用并回退关键词初筛；报告会明确区分“规则”和“AI”，不会把两种分数混在一起假装同一口径。
-- 每次运行显示抓取、时效、关键词、全文、重复、AI、门槛和最终入选的真实漏斗；零结果会给出具体原因。
-- 完整备份可以在另一台 Mac 上预览后安全合并。导入前自动生成本机备份；本机配置优先，DeepSeek Key 永不进入备份。单个导入包上限为 100 MiB。
+- 报告明确分成“核心新闻”和“补充阅读”；层级按该主题本次的核心线/补充线快照与实际得分计算。
+- 每次运行把真实漏斗分为“发现 / 处理 / 结果”，并可按主题、来源展开处理量与淘汰原因。零结果会给出具体原因；若本次新增为 0，仍显示上次有效报告并同时标明两次时间。
+- 完整备份可以在另一台 Mac 上预览后安全合并。导入前自动生成本机备份；本机配置优先。可选择恢复门槛、数量、时效、刷新、全文和智能补充等便携设置，默认不勾选；DeepSeek Key、连接状态和首次设置状态永不进入导入范围。单个导入包上限为 100 MiB。
+
+### 1.2 新增来源与健康审计
+
+2026-09-10 使用应用相同的 User-Agent 和 5 MiB 上限做过只读审计。以下 8 个 feed 均为 HTTPS、HTTP 200、可识别 RSS、无需登录、最新条目在 60 天内；抽样条目的标题、网页链接和发布日期完整：
+
+| 预设 | RSS / Atom 入口 | 首页 | 条款 / 版权 |
+| --- | --- | --- | --- |
+| SEC · Press Releases | `https://www.sec.gov/news/pressreleases.rss` | `https://www.sec.gov/newsroom/press-releases` | `https://www.sec.gov/about/privacy-information` |
+| SEC · Speeches & Statements | `https://www.sec.gov/news/speeches-statements.rss` | `https://www.sec.gov/newsroom/speeches-statements` | `https://www.sec.gov/about/privacy-information` |
+| European Commission · Environment News | `https://environment.ec.europa.eu/node/92/rss_en` | `https://environment.ec.europa.eu/news_en` | `https://commission.europa.eu/legal-notice_en` |
+| European Commission · Trade News | `https://policy.trade.ec.europa.eu/node/2/rss_en` | `https://policy.trade.ec.europa.eu/news_en` | `https://commission.europa.eu/legal-notice_en` |
+| BIS · Media Releases | `https://www.bis.org/doclist/all_pressrels.rss` | `https://www.bis.org/media/news` | `https://www.bis.org/about/terms-conditions` |
+| NASA · News Releases | `https://www.nasa.gov/news-release/feed/` | `https://www.nasa.gov/news-release/` | `https://www.nasa.gov/privacy/` |
+| NASA · Technology | `https://www.nasa.gov/technology/feed/` | `https://www.nasa.gov/technology/` | `https://www.nasa.gov/privacy/` |
+| TechCrunch | `https://techcrunch.com/feed/` | `https://techcrunch.com/` | `https://techcrunch.com/terms-of-service/` |
+
+计划中的 IMF News/Blog 官方入口对应用客户端返回 HTTP 403，因此正式目录没有放入一个明知不可抓取的 IMF 源，而是明确使用同类的 **BIS · Media Releases** 作为国际宏观/金融政策候补；它不会被伪装成 IMF。JPL 的 feed 同样返回 403，第二个 NASA 源改用 NASA 官方 RSS 目录列出的 Technology feed。
+
+Feed 是自动抓取的硬门槛；首页和条款只是供用户在浏览器查阅的元数据链接。SEC 的两个 feed 对应用客户端为 200，但其首页/隐私页会对自动化浏览器 User-Agent 返回 403，因此后者不参与 feed 健康判定。可随时手动复核：
+
+```bash
+PYTHONPATH=src python scripts/audit_source_presets.py
+```
 
 ## 安装（发给 Mac 使用者）
 
@@ -38,7 +63,7 @@ GitHub Release 会提供三个可长期直接下载的文件：
 
 ### 必须知道的签名限制
 
-1.1.0 没有 Apple Developer 证书，因此没有经过 Apple 公证。构建过程会做 **ad-hoc 完整性签名** 并验证签名，但这不等同于开发者签名或 Apple 公证。macOS 第一次运行仍会要求使用者手动批准，这是预期行为，不是安装失败。
+1.2.0 没有 Apple Developer 证书，因此没有经过 Apple 公证。构建过程会做 **ad-hoc 完整性签名** 并验证签名，但这不等同于开发者签名或 Apple 公证。macOS 第一次运行仍会要求使用者手动批准，这是预期行为，不是安装失败。
 
 如果 macOS 报告下载损坏，先重新下载并对照 `SHA256SUMS.txt`；不要为了绕过提示随意执行来源不明的终端命令。
 
@@ -48,7 +73,7 @@ GitHub Release 会提供三个可长期直接下载的文件：
 
 1. 打开仓库的 **Actions** 页面。
 2. 左侧选择 **Build Intel macOS DMG**。
-3. 点 **Run workflow**，输入与源码一致的版本号（当前为 `1.1.0`）并运行。
+3. 点 **Run workflow**，输入与源码一致的版本号（当前为 `1.2.0`）并运行。
 4. 等待 `Test and package x86_64 app` 变为绿色。
 5. 打开本次运行，在页面底部 **Artifacts** 下载 `Cookies-News-Cockpit-<版本>-Intel`。
 6. 解开 GitHub 自动生成的外层 ZIP，在目标 Intel Mac 上安装并完成实际验收。
@@ -60,15 +85,15 @@ GitHub Release 会提供三个可长期直接下载的文件：
 请先确认候选构建为绿色，并在目标 Intel Mac 上完成安装、首次放行、启动、抓取和 DeepSeek 连接测试。然后只用 GitHub 网页完成正式发布：
 
 1. 打开仓库的 **Releases** 页面，点 **Draft a new release**。
-2. 在 **Choose a tag** 中输入与源码版本对应的标签，例如 `v1.1.0`，选择 **Create new tag: v1.1.0 on publish**；目标分支选 `main`。
-3. 标题可填 `Cookies News Cockpit 1.1.0`。此时不要手动上传从 Actions 下载的外层 ZIP。
+2. 在 **Choose a tag** 中输入与源码版本对应的标签，例如 `v1.2.0`，选择 **Create new tag: v1.2.0 on publish**；目标分支选 `main`。
+3. 标题可填 `Cookies News Cockpit 1.2.0`。此时不要手动上传从 Actions 下载的外层 ZIP。
 4. 点 **Publish release**。GitHub 创建标签后会自动触发 **Build Intel macOS DMG**；刚发布的 Release 可能暂时还没有安装文件，这是正常的。
-5. 回到 **Actions**，等待这次由 `v1.1.0` 标签触发的运行变为绿色。发布步骤会识别网页端已存在的同名 Release，覆盖同名资产并更新标准标题和说明，不会因为 Release 已存在而冲突失败。
+5. 回到 **Actions**，等待这次由 `v1.2.0` 标签触发的运行变为绿色。发布步骤会识别网页端已存在的同名 Release，覆盖同名资产并更新标准标题和说明，不会因为 Release 已存在而冲突失败。
 6. 回到 **Releases** 刷新页面，确认出现 `.dmg`、`.dmg.zip` 和 `SHA256SUMS.txt` 三个资产后，再把 Release 页面或其中的 `.dmg.zip` 链接发给使用者。
 
 如果标签触发的运行失败，不要分享那个 Release。网络等瞬时故障可在运行页面选择 **Re-run all jobs**；如果是代码或版本问题，应修复后发布新的补丁版本，不要移动已经公开的标签。
 
-正式 Release 资产会一直保留到维护者主动删除，并提供每个文件的直接下载入口；Actions artifact 仍只保留 30 天。推送形如 `v1.1.0` 的 Git tag 也会走同一条正式发布流水线。
+正式 Release 资产会一直保留到维护者主动删除，并提供每个文件的直接下载入口；Actions artifact 仍只保留 30 天。推送形如 `v1.2.0` 的 Git tag 也会走同一条正式发布流水线。
 
 流水线会执行：自动测试 → 生成 Cookie ICNS 图标 → PyInstaller `onedir/windowed` App → x86_64 架构检查 → ad-hoc 签名与验证 → DMG 压缩 → DMG 校验 → SHA-256 → artifact 上传。只有前述校验全部通过，构建出的三个正式资产才会上传到 Release；判断正式版是否可分享时，以标签构建绿色且三个资产齐全为准。
 
@@ -87,7 +112,7 @@ cookies-news-cockpit
 仅在 Intel macOS 上构建安装包：
 
 ```bash
-APP_VERSION=1.1.0 bash packaging/build_macos.sh
+APP_VERSION=1.2.0 bash packaging/build_macos.sh
 ```
 
 产物写入 `release/`。脚本拒绝在非 macOS 或非 x86_64 机器上打包，避免误发架构不匹配的应用。
@@ -103,6 +128,7 @@ APP_VERSION=1.1.0 bash packaging/build_macos.sh
 ### 更新与迁移
 
 - **同一台 Mac 更新：**退出旧版，把新 App 拖进“应用程序”并选择替换。主题、关键词、来源、历史、收藏和钥匙串中的 Key 都留在原位置，无需重新输入。
+- **1.1 → 1.2：**继续使用同一个应用数据目录。目录同步只新增 8 个关闭状态的预设，不覆盖用户改过的来源，也不会启用它们；主题、来源启停、便携设置、历史和 Key 保持原状。
 - **换一台 Mac：**在旧 Mac 的设置中导出完整备份；在新 Mac 安装后选择“导入备份”，先看冲突预览，再执行“保留本机配置并合并”。DeepSeek Key 必须在新 Mac 的钥匙串中重新输入一次。
 - **回滚：**导入前生成的自动备份保存在应用数据目录的 `backups` 文件夹。不要用复制数据库文件的方式跨版本迁移。
 
@@ -116,7 +142,7 @@ PyInstaller 使用 `onedir`，DMG 使用 UDZO 压缩。项目的保守目标是�
 - 不使用 Apple 签名密钥，也不向工作流上传证书。
 - 不开放局域网端口；生产包只允许本机浏览器访问。
 - 私有仓库依然应避免提交新闻站点账号、付费 Cookie、API Key 或个人数据。
-- 1.1.0 只支持 RSS/Atom；普通网站首页不能直接当 RSS 使用，也没有隐藏的搜索引擎或网页爬虫。
+- 1.2.0 只支持 RSS/Atom；普通网站首页不能直接当 RSS 使用，也没有隐藏的搜索引擎或网页爬虫。
 - “每小时刷新”只在应用和驾驶舱仍运行时工作，不是关掉 App 后继续运行的系统级后台任务。
 
 内置字体及其开放字体许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

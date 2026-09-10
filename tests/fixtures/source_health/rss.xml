@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Offline RSS Fixture</title>
+    <link>https://fixture.example/</link>
+    <description>Network-free source health test.</description>
+    <item>
+      <title>First verified story</title>
+      <link>https://fixture.example/story-1</link>
+      <guid>fixture-story-1</guid>
+      <pubDate>Wed, 09 Sep 2026 08:00:00 GMT</pubDate>
+    </item>
+    <item>
+      <title>Second verified story</title>
+      <link>https://fixture.example/story-2</link>
+      <guid>fixture-story-2</guid>
+      <pubDate>Tue, 08 Sep 2026 08:00:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>

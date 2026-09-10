@@ -81,8 +81,10 @@
     [
       "offline-banner", "retry-bootstrap", "service-label", "metric-topics", "metric-sources",
       "metric-last-run", "metric-run-state", "topic-count", "topic-rail-list", "show-all-topics",
-      "latest-summary", "latest-list", "run-progress", "run-progress-title", "run-progress-detail",
-      "progress-fill", "run-funnel", "funnel-fetched", "funnel-fresh", "funnel-matched", "funnel-fulltext", "funnel-duplicates", "funnel-ai", "funnel-threshold", "funnel-kept", "cancel-run", "source-errors",
+      "latest-summary", "latest-list", "report-context", "run-progress", "run-progress-title", "run-progress-detail",
+      "progress-fill", "run-funnel", "funnel-breakdown", "funnel-fetched", "funnel-fresh", "funnel-matched", "funnel-unique", "funnel-fulltext", "funnel-fulltext-success",
+      "funnel-semantic-initial", "funnel-semantic-additional", "funnel-semantic", "funnel-duplicates", "funnel-history-duplicates", "funnel-run-duplicates",
+      "funnel-ai", "funnel-ai-success", "funnel-ai-failure", "funnel-core", "funnel-supplement", "funnel-below-supplement", "funnel-threshold", "funnel-budget", "funnel-kept", "cancel-run", "source-errors",
       "run-badge", "run-mode", "run-analysis-mode", "run-model", "run-cap", "run-dedupe", "run-retention",
       "topic-sheet", "source-sheet", "deepseek-badge", "deepseek-action", "history-filter",
       "history-query", "history-topic", "history-favorite", "history-list", "history-load-more", "dock-status", "dock-note",
@@ -97,7 +99,7 @@
       "calibration-body", "confirm-calibration", "toast-region", "open-search", "open-settings",
       "add-topic-rail", "add-topic", "add-source", "open-deepseek", "export-report", "import-report", "import-file", "shutdown-app", "shutdown-state", "shutdown-copy",
       "onboarding-dialog", "onboarding-step-label", "onboarding-title", "onboarding-copy", "skip-onboarding", "wizard-source-categories", "wizard-topic-name", "wizard-topic-keywords",
-      "wizard-deepseek-key", "wizard-key-result", "wizard-test-key", "wizard-back", "wizard-skip-step", "wizard-next", "import-dialog", "import-preview", "apply-import"
+      "wizard-deepseek-key", "wizard-key-result", "wizard-test-key", "wizard-back", "wizard-skip-step", "wizard-next", "import-dialog", "import-preview", "import-portable-settings", "apply-import"
     ].forEach((id) => {
       refs[toCamel(id)] = document.getElementById(id);
     });
@@ -341,6 +343,117 @@
     });
   }
 
+  function firstNumeric(record, ...keys) {
+    for (const key of keys) {
+      const candidate = record?.[key];
+      if (candidate !== "" && candidate !== null && candidate !== undefined && Number.isFinite(Number(candidate))) {
+        return Number(candidate);
+      }
+    }
+    return null;
+  }
+
+  function funnelNumber(run, ...keys) {
+    return firstNumeric(run?.funnel || {}, ...keys) ?? firstNumeric(run || {}, ...keys);
+  }
+
+  function duplicateCount(run) {
+    const legacyTotal = funnelNumber(run, "duplicates_skipped", "duplicate_count");
+    if (legacyTotal !== null) return legacyTotal;
+    const history = funnelNumber(run, "history_duplicates");
+    const current = funnelNumber(run, "run_duplicates");
+    return history !== null || current !== null ? (history || 0) + (current || 0) : null;
+  }
+
+  function topicFunnelFor(report, article) {
+    const funnel = report?.run?.funnel || report?.funnel || {};
+    const collection = funnel.per_topic || funnel.by_topic || report?.run?.topic_funnels || report?.topic_funnels;
+    const topicId = article?.topic_id;
+    if (Array.isArray(collection)) {
+      const direct = collection.find((item) => (item.topic_id || item.id) === topicId);
+      if (direct) return direct;
+    } else if (collection && typeof collection === "object") {
+      const direct = topicId && Object.prototype.hasOwnProperty.call(collection, topicId)
+        ? collection[topicId]
+        : null;
+      if (direct && typeof direct === "object") return direct;
+    }
+
+    const topicName = typeof article?.topic_name === "string"
+      ? article.topic_name.trim().toLocaleLowerCase()
+      : "";
+    if (!topicName) return null;
+    const snapshots = Array.isArray(collection)
+      ? collection
+      : collection && typeof collection === "object"
+        ? Object.values(collection)
+        : [];
+    const matches = snapshots.filter((snapshot) => {
+      if (!snapshot || typeof snapshot !== "object") return false;
+      const name = typeof snapshot.name === "string" ? snapshot.name : snapshot.topic_name;
+      return typeof name === "string" && name.trim().toLocaleLowerCase() === topicName;
+    });
+    return matches.length === 1 ? matches[0] : null;
+  }
+
+  function articleTier(article, report) {
+    const snapshot = topicFunnelFor(report, article);
+    const coreThreshold = firstNumeric(snapshot, "core_threshold", "threshold");
+    const supplementThreshold = firstNumeric(snapshot, "supplement_threshold", "extended_threshold");
+    const score = firstNumeric(article, "score");
+    if (score === null || coreThreshold === null || supplementThreshold === null) return "core";
+    if (score >= coreThreshold) return "core";
+    if (score >= supplementThreshold) return "supplement";
+    return "supplement";
+  }
+
+  function runTimestamp(run) {
+    return run?.finished_at || run?.completed_at || run?.started_at || run?.created_at || null;
+  }
+
+  function reportTimestamp(report) {
+    return report?.generated_at || report?.created_at || runTimestamp(report?.run) || null;
+  }
+
+  function retainedReportContext(report) {
+    const current = state.currentRun;
+    const reportRun = report?.run;
+    if (!current || !reportRun || !FINAL_RUN_STATES.has(current.status)) return null;
+    const selected = funnelNumber(current, "selected", "kept", "stored_count") ?? firstNumeric(current, "article_count") ?? 0;
+    if (selected !== 0) return null;
+    const differentIds = Boolean(current.id && reportRun.id && current.id !== reportRun.id);
+    const currentTime = runTimestamp(current);
+    const effectiveTime = reportTimestamp(report);
+    const differentTimes = Boolean(currentTime && effectiveTime && currentTime !== effectiveTime);
+    if (!differentIds && !differentTimes) return null;
+    return { currentTime, effectiveTime };
+  }
+
+  function renderReportContext(report) {
+    const context = retainedReportContext(report);
+    refs.reportContext.replaceChildren();
+    refs.reportContext.hidden = !context;
+    if (!context) return;
+    refs.reportContext.append(
+      node("strong", { text: "本次新增 0 条 · 当前为上次有效报告" }),
+      node("span", {
+        text: `本次任务：${dateLabel(context.currentTime)} · 当前报告：${dateLabel(context.effectiveTime)}`
+      })
+    );
+  }
+
+  function reportTier(title, copy, articles, tier, report) {
+    const section = node("section", { className: "report-tier", "data-tier": tier });
+    const heading = node("div", { className: "report-tier__heading" }, [
+      node("div", {}, [node("h3", { text: title }), node("p", { text: copy })]),
+      node("span", { className: "report-tier__count", text: `${articles.length} 条` })
+    ]);
+    const list = node("div", { className: "report-tier__list" });
+    articles.forEach((article) => list.append(articleRow(article, "story", tier)));
+    section.append(heading, list);
+    return section;
+  }
+
   async function refreshBootstrap({ quiet = false } = {}) {
     try {
       const payload = await api("/api/bootstrap");
@@ -450,13 +563,14 @@
     const articles = activeArticles();
     refs.latestList.replaceChildren();
     renderSourceErrors(report);
+    renderReportContext(report);
 
     if (report?.run) {
       const sourceErrors = Array.isArray(report.source_errors) ? report.source_errors.length : 0;
       const suffix = sourceErrors ? `，${sourceErrors} 个来源异常` : "";
-      const duplicates = Number(report.run.duplicates_skipped || 0);
+      const duplicates = duplicateCount(report.run);
       const duplicateSuffix = duplicates ? `，已拦截 ${duplicates} 条近 7 天重复` : "";
-      refs.latestSummary.textContent = `${dateLabel(report.run.finished_at || report.run.started_at)} · ${report.articles?.length || 0} 条${suffix}${duplicateSuffix}`;
+      refs.latestSummary.textContent = `报告时间 ${dateLabel(reportTimestamp(report))} · ${report.articles?.length || 0} 条${suffix}${duplicateSuffix}`;
     } else {
       refs.latestSummary.textContent = "等待第一次抓取。";
     }
@@ -464,12 +578,13 @@
     if (!articles.length) {
       const filtered = Boolean(state.activeTopicId || state.reportFilter === "favorite");
       const outcome = report?.run?.outcome || state.currentRun?.outcome;
-      const duplicateOnly = Number(report?.run?.duplicates_skipped || state.currentRun?.duplicates_skipped || 0) > 0;
+      const duplicateOnly = (duplicateCount(report?.run) ?? duplicateCount(state.currentRun) ?? 0) > 0;
       const outcomeMessages = {
         cancelled: ["任务已取消", "已保留上一份有效报告；可以随时重新运行。"],
         all_sources_failed: ["来源暂时都无法读取", "查看来源错误，修复地址或稍后重试；上一份有效报告未被覆盖。"],
         no_fresh_articles: ["所选时效内没有可用新闻", "可以检查来源日期，或在设置里调整新闻时效。"],
-        no_keyword_match: ["近期新闻未命中主题", "可以扩展关键词、检查排除词，或启用语义兜底。"],
+        no_keyword_match: ["近期新闻未命中主题", "可以扩展关键词、检查排除词，或启用结果不足时智能补充。"],
+        no_relevant_after_ai: ["智能复核后仍没有相关新闻", "已检查本次候选，但没有足够证据与主题相关；可以补充更具体的关键词、别名或可靠来源后再试。"],
         no_match: ["本次没有新闻达到门槛", "可以降低入选分数、扩展关键词，或检查排除词。"],
         no_matches: ["本次没有新闻达到门槛", "可以降低入选分数、扩展关键词，或检查排除词。"],
         below_threshold: ["候选新闻都低于门槛", "可以降低入选分数，或继续保持严格筛选。"],
@@ -501,7 +616,29 @@
       return;
     }
 
-    articles.forEach((article) => refs.latestList.append(articleRow(article, "story")));
+    const core = [];
+    const supplement = [];
+    articles.forEach((article) => {
+      (articleTier(article, report) === "supplement" ? supplement : core).push(article);
+    });
+    if (core.length) {
+      refs.latestList.append(reportTier(
+        "核心新闻",
+        "达到该主题本次核心门槛，优先阅读。",
+        core,
+        "core",
+        report
+      ));
+    }
+    if (supplement.length) {
+      refs.latestList.append(reportTier(
+        "补充阅读",
+        "达到补充线但未达到核心门槛，用于补足背景和弱信号。",
+        supplement,
+        "supplement",
+        report
+      ));
+    }
   }
 
   function renderSourceErrors(report) {
@@ -519,9 +656,16 @@
     refs.sourceErrors.append(list);
   }
 
-  function articleRow(article, variant = "story") {
+  function articleRow(article, variant = "story", tier = null) {
     const body = node("div", { className: `${variant}-row__body` });
     const meta = node("div", { className: `${variant}-row__meta` });
+    if (tier) {
+      meta.append(node("span", {
+        className: "selection-label",
+        text: tier === "supplement" ? "补充" : "核心",
+        "data-tier": tier
+      }));
+    }
     if (article.topic_name) meta.append(node("span", { className: "topic-label", text: article.topic_name }));
     if (article.source_name) meta.append(node("span", { text: article.source_name }));
     if (article.published_at) meta.append(node("span", { text: dateLabel(article.published_at) }));
@@ -593,7 +737,7 @@
     refs.runModel.textContent = state.deepseek.model || "deepseek-v4-flash";
     const analyses = Number(run?.analyses ?? run?.analysis_count);
     refs.runCap.textContent = Number.isFinite(analyses) ? `${analyses} / 500 次分析` : "500 次分析";
-    const duplicates = Number(run?.duplicates_skipped || 0);
+    const duplicates = duplicateCount(run);
     refs.runDedupe.textContent = duplicates ? `近 7 天 · 拦截 ${duplicates} 条` : "默认 · 近 7 天";
     refs.runRetention.textContent = "30 天";
     refs.metricRunState.textContent = runStatusLabel(status);
@@ -674,22 +818,136 @@
   }
 
   function renderRunFunnel(run) {
-    const funnel = run?.funnel || {};
     const value = (...keys) => {
-      for (const key of keys) {
-        const candidate = funnel[key] ?? run?.[key];
-        if (Number.isFinite(Number(candidate))) return String(Number(candidate));
-      }
-      return "—";
+      const candidate = funnelNumber(run, ...keys);
+      return candidate === null ? "—" : String(candidate);
     };
+    const historyDuplicates = funnelNumber(run, "history_duplicates");
+    const runDuplicates = funnelNumber(run, "run_duplicates");
+    const duplicateTotal = duplicateCount(run);
+    const budget = funnelNumber(run, "semantic_budget_exhausted", "budget_exhausted");
+
     refs.funnelFetched.textContent = value("feed_items", "fetched", "fetched_count", "candidate_count");
     refs.funnelFresh.textContent = value("fresh", "fresh_count");
     refs.funnelMatched.textContent = value("keyword_hits", "matched", "keyword_matched", "matched_count");
+    refs.funnelUnique.textContent = value("unique_candidates", "unique", "deduped_candidates");
     refs.funnelFulltext.textContent = value("fulltext_fetches", "fulltext_count");
-    refs.funnelDuplicates.textContent = value("duplicates_skipped", "duplicate_count");
+    refs.funnelFulltextSuccess.textContent = value("fulltext_success", "fulltext_succeeded");
+    refs.funnelSemanticInitial.textContent = value("semantic_initial_reviewed", "semantic_fallback");
+    refs.funnelSemanticAdditional.textContent = value("semantic_additional_reviewed", "semantic_expansion");
+    refs.funnelSemantic.textContent = value("semantic_reviewed", "semantic_fallback");
     refs.funnelAi.textContent = value("ai_requests", "ai_reviewed", "analysis_count");
+    refs.funnelAiSuccess.textContent = value("ai_success");
+    refs.funnelAiFailure.textContent = value("ai_failure");
+    refs.funnelHistoryDuplicates.textContent = historyDuplicates === null ? "—" : String(historyDuplicates);
+    refs.funnelRunDuplicates.textContent = runDuplicates === null ? "—" : String(runDuplicates);
+    refs.funnelDuplicates.textContent = duplicateTotal === null ? "—" : String(duplicateTotal);
+    refs.funnelCore.textContent = value("core_selected");
+    refs.funnelSupplement.textContent = value("supplement_selected", "extended_selected");
+    refs.funnelBelowSupplement.textContent = value("below_supplement", "below_extended");
     refs.funnelThreshold.textContent = value("threshold_rejected", "below_threshold");
+    refs.funnelBudget.textContent = budget === null ? "—" : budget > 0 ? "是" : "否";
     refs.funnelKept.textContent = value("selected", "kept", "article_count", "stored_count");
+    renderFunnelBreakdown(run);
+  }
+
+  function funnelCollection(run, ...keys) {
+    const funnel = run?.funnel || {};
+    for (const key of keys) {
+      const candidate = funnel[key] ?? run?.[key];
+      if (Array.isArray(candidate)) return candidate;
+      if (candidate && typeof candidate === "object") {
+        return Object.entries(candidate).map(([id, item]) => ({ id, ...(item || {}) }));
+      }
+    }
+    return [];
+  }
+
+  function breakdownReasonRows(item) {
+    const aliases = [
+      ["date_missing", "缺少发布日期"],
+      ["date_invalid", "发布日期无效"],
+      ["date_stale", "超出新闻时效"],
+      ["date_future", "日期明显来自未来"],
+      ["exclusion_rejected", "命中排除词"],
+      ["reason_off_topic", "语义判断不相关"],
+      ["reason_exclusion_match", "语义判断命中排除条件"],
+      ["reason_insufficient_evidence", "相关证据不足"],
+      ["below_supplement", "低于补充阅读线", "below_extended"],
+      ["history_duplicates", "近 7 天历史重复"],
+      ["run_duplicates", "本次任务内重复"]
+    ];
+    const rows = aliases.flatMap(([key, label, legacy]) => {
+      const value = firstNumeric(item, key, legacy);
+      return value && value > 0 ? [[label, value]] : [];
+    });
+    const extra = item.rejection_reasons || item.rejected_by_reason || item.reasons;
+    if (extra && typeof extra === "object" && !Array.isArray(extra)) {
+      Object.entries(extra).forEach(([reason, count]) => {
+        if (Number.isFinite(Number(count)) && Number(count) > 0) rows.push([reason, Number(count)]);
+      });
+    }
+    return rows;
+  }
+
+  function renderBreakdownGroup(title, items, kind) {
+    const section = node("section", { className: "funnel-breakdown__group" });
+    section.append(node("strong", { text: title }));
+    items.forEach((item) => {
+      const id = item.topic_id || item.source_id || item.id;
+      const fallback = kind === "topic"
+        ? state.topics.find((topic) => topic.id === id)?.name
+        : state.sources.find((source) => source.id === id)?.name;
+      const name = item.name || item.topic_name || item.source_name || fallback || "未命名";
+      const selected = firstNumeric(item, "selected", "kept");
+      const detail = node("details", { className: "funnel-detail" });
+      const summaryCopy = kind === "topic"
+        ? `核心线 ${firstNumeric(item, "core_threshold", "threshold") ?? "—"} · 补充线 ${firstNumeric(item, "supplement_threshold", "extended_threshold") ?? "—"}`
+        : `入选 ${selected ?? 0} 条`;
+      detail.append(node("summary", {}, [
+        node("span", { text: name }),
+        node("small", { text: summaryCopy })
+      ]));
+      const definitions = kind === "topic"
+        ? [
+          ["发现", ["discovered", "feed_items"]],
+          ["去重候选", ["unique_candidates"]],
+          ["语义复核", ["semantic_reviewed", "semantic_fallback"]],
+          ["核心", ["core_selected"]],
+          ["补充", ["supplement_selected", "extended_selected"]],
+          ["最终入选", ["selected", "kept"]]
+        ]
+        : [
+          ["抓取", ["feed_items", "fetched"]],
+          ["时效内", ["fresh"]],
+          ["去重候选", ["unique_candidates"]],
+          ["全文成功", ["fulltext_success"]],
+          ["最终入选", ["selected", "kept"]]
+        ];
+      const metrics = node("dl", { className: "funnel-detail__metrics" });
+      definitions.forEach(([label, keys]) => {
+        const count = firstNumeric(item, ...keys);
+        if (count !== null) metrics.append(node("div", {}, [node("dt", { text: label }), node("dd", { text: String(count) })]));
+      });
+      if (metrics.childElementCount) detail.append(metrics);
+      const reasons = breakdownReasonRows(item);
+      if (reasons.length) {
+        const list = node("ul", { className: "funnel-reasons" });
+        reasons.forEach(([label, count]) => list.append(node("li", { text: `${label}：${count}` })));
+        detail.append(node("p", { className: "funnel-reasons__title", text: "处理与淘汰原因" }), list);
+      }
+      section.append(detail);
+    });
+    return section;
+  }
+
+  function renderFunnelBreakdown(run) {
+    const topics = funnelCollection(run, "per_topic", "by_topic", "topic_funnels");
+    const sources = funnelCollection(run, "per_source", "by_source", "source_funnels");
+    refs.funnelBreakdown.replaceChildren();
+    refs.funnelBreakdown.hidden = !(topics.length || sources.length);
+    if (topics.length) refs.funnelBreakdown.append(renderBreakdownGroup("按主题展开", topics, "topic"));
+    if (sources.length) refs.funnelBreakdown.append(renderBreakdownGroup("按来源展开", sources, "source"));
   }
 
   function renderTopicSheet() {
@@ -1396,7 +1654,7 @@
         if (state.currentRun.status !== previous) {
           const duplicateOnly = state.currentRun.status === "complete"
             && Number(state.currentRun.article_count || 0) === 0
-            && Number(state.currentRun.duplicates_skipped || 0) > 0;
+            && (duplicateCount(state.currentRun) || 0) > 0;
           notify(
             duplicateOnly
               ? "重复审核完成：近 7 天内没有新增新闻"
@@ -1583,6 +1841,7 @@
         timeout: 60000
       }), { loading: "检查中", success: "可以导入" });
       state.importPreview = payload;
+      refs.importPortableSettings.checked = false;
       renderImportPreview();
       openDialog(refs.importDialog, refs.applyImport);
     } catch (_) { /* surfaced by runButtonTask */ }
@@ -1623,7 +1882,10 @@
     try {
       const result = await runButtonTask(refs.applyImport, () => api(`/api/import/${encodeURIComponent(previewId)}/apply`, {
         method: "POST",
-        body: { strategy: "merge_keep_local" },
+        body: {
+          strategy: "merge_keep_local",
+          import_portable_settings: refs.importPortableSettings.checked
+        },
         timeout: 60000
       }), { loading: "合并中", success: "导入完成" });
       closeDialog(refs.importDialog);

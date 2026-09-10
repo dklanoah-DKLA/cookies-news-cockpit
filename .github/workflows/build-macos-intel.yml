@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "版本号（必须与源码一致，例如 1.1.0）"
+        description: "版本号（必须与源码一致，例如 1.2.0）"
         required: true
-        default: "1.1.0"
+        default: "1.2.0"
         type: string
   push:
     tags:
@@ -66,8 +66,10 @@ jobs:
 
       - name: Run automated tests
         run: |
-          python -m ruff check src tests
+          python -m ruff check src tests scripts
           python -m pytest
+          PYTHONPATH=src python scripts/audit_source_presets.py \
+            --fixture tests/fixtures/source_health/rss.xml
 
       - name: Install browser test driver
         run: |
@@ -178,7 +180,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           release_title="Cookies News Cockpit ${APP_VERSION}"
-          release_notes="Intel macOS 14+ build. This release is ad-hoc signed and not Apple-notarized; follow the first-launch instructions in README.md."
+          release_notes="Intel macOS 14+ build. Version 1.2 adds core/supplement report tiers, a three-stage funnel and opt-in catalog v2 sources. This release is ad-hoc signed and not Apple-notarized; follow the first-launch instructions in README.md."
 
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             echo "Release ${GITHUB_REF_NAME} already exists; its named assets and standard notes will be refreshed."

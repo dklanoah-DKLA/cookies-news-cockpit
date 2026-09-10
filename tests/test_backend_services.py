@@ -52,7 +52,10 @@ async def test_deepseek_retries_once_when_json_is_invalid(invalid_content: objec
         content = (
             invalid_content
             if calls == 1
-            else '{"score":88,"summary":"摘要","analysis":"分析"}'
+            else (
+                '{"relevant":true,"reason":"direct_match",'
+                '"score":88,"summary":"摘要","analysis":"分析"}'
+            )
         )
         return httpx.Response(
             200,
@@ -87,7 +90,10 @@ async def test_deepseek_retries_valid_json_with_invalid_analysis_schema() -> Non
         content = (
             '{"score":999,"summary":"摘要","analysis":"分析"}'
             if calls == 1
-            else '{"score":88,"summary":"摘要","analysis":"分析"}'
+            else (
+                '{"relevant":true,"reason":"direct_match",'
+                '"score":88,"summary":"摘要","analysis":"分析"}'
+            )
         )
         return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
 
@@ -168,7 +174,10 @@ async def test_deepseek_retries_share_one_total_deadline() -> None:
                 "choices": [
                     {
                         "message": {
-                            "content": '{"score":88,"summary":"摘要","analysis":"分析"}'
+                            "content": (
+                                '{"relevant":true,"reason":"direct_match",'
+                                '"score":88,"summary":"摘要","analysis":"分析"}'
+                            )
                         }
                     }
                 ]

@@ -245,6 +245,7 @@ class RunRequest(StrictModel):
 
 class ImportApplyInput(StrictModel):
     strategy: Literal["merge_keep_local"] = "merge_keep_local"
+    import_portable_settings: bool = False
 
 
 class FavoriteUpdate(StrictModel):
@@ -265,6 +266,15 @@ class AIAnalysis(StrictModel):
     score: int = Field(ge=0, le=100)
     summary: str = Field(min_length=1, max_length=2000)
     analysis: str = Field(min_length=1, max_length=5000)
+    relevant: bool = True
+    reason: Literal[
+        "direct_match",
+        "contextual_match",
+        "background_context",
+        "off_topic",
+        "exclusion_match",
+        "insufficient_evidence",
+    ] = "direct_match"
 
     @field_validator("summary", "analysis")
     @classmethod

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Missing Date RSS Fixture</title>
+    <link>https://fixture.example/</link>
+    <description>An entry without a date.</description>
+    <item>
+      <title>Undated story</title>
+      <link>https://fixture.example/undated</link>
+    </item>
+  </channel>
+</rss>

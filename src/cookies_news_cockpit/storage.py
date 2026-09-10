@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
+import tempfile
 import threading
 import uuid
 from collections.abc import Iterator, Sequence
@@ -17,6 +19,19 @@ from .models import Settings, SettingsUpdate, SourceInput, SourcePatch, TopicInp
 from .presets import PRESET_CATALOG_VERSION, SOURCE_PRESETS
 
 SCHEMA_VERSION = 2
+UPGRADE_CHECKPOINT = "upgrade_checkpoint_1_2_0"
+UPGRADE_SNAPSHOT_NAME = "before-upgrade-1.2.0.sqlite3"
+UPGRADE_LOCK_NAME = ".upgrade-1.2.0.lock.sqlite3"
+PORTABLE_SETTINGS_FIELDS = (
+    "default_threshold",
+    "default_article_limit",
+    "freshness_days",
+    "refresh_minutes",
+    "scheduler_enabled",
+    "extract_full_text",
+    "semantic_fallback_enabled",
+    "semantic_fallback_limit",
+)
 _SAFE_RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _WINDOWS_RESERVED_NAMES = {
     "aux",
@@ -213,6 +228,44 @@ def _import_text_list(value: Any, *, field: str, maximum: int = 100) -> list[str
             raise ValueError(f"备份字段 {field} 包含无效文本")
         result.append(item)
     return result
+
+
+def _portable_settings(configuration: dict[str, Any]) -> dict[str, Any]:
+    """Validate the deliberately small, device-independent settings surface."""
+
+    raw = configuration.get("settings", {})
+    if not isinstance(raw, dict):
+        raise ValueError("备份字段 settings 必须是对象")
+    values: dict[str, Any] = {}
+    integer_fields = {
+        "default_threshold": (0, 100),
+        "default_article_limit": (1, 100),
+        "refresh_minutes": (15, 1440),
+        "semantic_fallback_limit": (1, 20),
+    }
+    boolean_fields = {
+        "scheduler_enabled",
+        "extract_full_text",
+        "semantic_fallback_enabled",
+    }
+    for field, (minimum, maximum) in integer_fields.items():
+        if field in raw:
+            values[field] = _import_int(
+                raw[field], field=f"settings.{field}", minimum=minimum, maximum=maximum
+            )
+    for field in boolean_fields:
+        if field in raw:
+            values[field] = _import_bool(raw[field], field=f"settings.{field}", default=False)
+    if "freshness_days" in raw:
+        freshness = raw["freshness_days"]
+        if freshness is not None and (
+            isinstance(freshness, bool)
+            or not isinstance(freshness, int)
+            or freshness not in {1, 3, 7, 14, 30}
+        ):
+            raise ValueError("备份字段 settings.freshness_days 超出允许范围")
+        values["freshness_days"] = freshness
+    return {field: values[field] for field in PORTABLE_SETTINGS_FIELDS if field in values}
 
 
 def _validated_import_records(
@@ -546,7 +599,14 @@ class Database:
         with self._init_lock:
             if self._initialized:
                 return
-            with self.connect() as db:
+            # Separate Database instances and double-launched app processes do
+            # not share ``_init_lock``. A tiny sibling SQLite file supplies an
+            # OS-released cross-process lock without touching the live DB first.
+            with self._upgrade_process_lock(), self.connect() as db:
+                checkpoint_exists = self._upgrade_checkpoint_exists(db)
+                snapshot_name: str | None = None
+                if not checkpoint_exists and self._has_existing_database(db):
+                    snapshot_name = self._ensure_upgrade_snapshot(db)
                 db.execute("PRAGMA journal_mode = WAL")
                 db.executescript(
                     """
@@ -664,7 +724,102 @@ class Database:
                     """
                 )
                 self._migrate_v2(db)
+                if not checkpoint_exists:
+                    self._record_upgrade_checkpoint(db, snapshot_name)
             self._initialized = True
+
+    @contextmanager
+    def _upgrade_process_lock(self) -> Iterator[None]:
+        lock_path = self.path.parent / UPGRADE_LOCK_NAME
+        lock = sqlite3.connect(lock_path, timeout=120, isolation_level=None)
+        try:
+            lock.execute("BEGIN EXCLUSIVE")
+            yield
+        finally:
+            if lock.in_transaction:
+                lock.rollback()
+            lock.close()
+
+    @staticmethod
+    def _table_names(db: sqlite3.Connection) -> set[str]:
+        return {
+            str(row[0])
+            for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+
+    @classmethod
+    def _upgrade_checkpoint_exists(cls, db: sqlite3.Connection) -> bool:
+        if "metadata" not in cls._table_names(db):
+            return False
+        row = db.execute("SELECT 1 FROM metadata WHERE key = ?", (UPGRADE_CHECKPOINT,)).fetchone()
+        return row is not None
+
+    @classmethod
+    def _has_existing_database(cls, db: sqlite3.Connection) -> bool:
+        """Distinguish an existing installation from SQLite's new empty file."""
+
+        return bool(cls._table_names(db))
+
+    def _ensure_upgrade_snapshot(self, db: sqlite3.Connection) -> str:
+        """Create one atomic SQLite backup before 1.2 touches an existing database."""
+
+        backup_directory = self.path.parent / "backups"
+        backup_directory.mkdir(parents=True, exist_ok=True)
+        destination = backup_directory / UPGRADE_SNAPSHOT_NAME
+        if destination.exists() and self._valid_sqlite_snapshot(destination):
+            return destination.name
+
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=".before-upgrade-1.2.0-", suffix=".tmp", dir=backup_directory
+        )
+        os.close(descriptor)
+        temporary_path = Path(temporary)
+        try:
+            target = sqlite3.connect(temporary_path)
+            try:
+                db.backup(target)
+                result = target.execute("PRAGMA quick_check").fetchone()
+                if result is None or result[0] != "ok":
+                    raise sqlite3.DatabaseError("升级前数据库快照完整性校验失败")
+                target.commit()
+            finally:
+                target.close()
+            with temporary_path.open("r+b") as handle:
+                os.fsync(handle.fileno())
+            temporary_path.replace(destination)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+        return destination.name
+
+    @staticmethod
+    def _valid_sqlite_snapshot(path: Path) -> bool:
+        """Validate an existing immutable checkpoint without creating sidecars."""
+
+        try:
+            uri = f"{path.resolve().as_uri()}?mode=ro&immutable=1"
+            snapshot = sqlite3.connect(uri, uri=True)
+            try:
+                result = snapshot.execute("PRAGMA quick_check").fetchone()
+            finally:
+                snapshot.close()
+            return result is not None and result[0] == "ok"
+        except (OSError, sqlite3.Error, ValueError):
+            return False
+
+    @staticmethod
+    def _record_upgrade_checkpoint(db: sqlite3.Connection, snapshot_name: str | None) -> None:
+        payload = {
+            "version": "1.2.0",
+            "created_at": utc_now(),
+            "snapshot": snapshot_name,
+        }
+        db.execute(
+            """INSERT INTO metadata(key, value) VALUES(?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+            (UPGRADE_CHECKPOINT, json.dumps(payload, ensure_ascii=False)),
+        )
 
     @staticmethod
     def _columns(db: sqlite3.Connection, table: str) -> set[str]:
@@ -1392,60 +1547,81 @@ class Database:
             )
         return self.get_run(run_id)
 
-    def insert_article(self, article: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _insert_article_in_connection(
+        db: sqlite3.Connection, article: dict[str, Any]
+    ) -> str:
         article_id = article.get("id") or uuid.uuid4().hex
-        with self.connect() as db:
-            try:
+        try:
+            db.execute(
+                """INSERT INTO articles
+            (id, run_id, topic_id, source_id, title, url, excerpt, full_text,
+             summary, analysis, score, published_at, created_at, content_hash,
+             analysis_mode, model, matched_keywords_json, matched_fields_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    article_id,
+                    article["run_id"],
+                    article["topic_id"],
+                    article["source_id"],
+                    article["title"],
+                    article["url"],
+                    article.get("excerpt", ""),
+                    article.get("full_text", ""),
+                    article.get("summary", ""),
+                    article.get("analysis", ""),
+                    article.get("score"),
+                    article.get("published_at"),
+                    utc_now(),
+                    article["content_hash"],
+                    article.get("analysis_mode", "rules"),
+                    article.get("model"),
+                    json.dumps(article.get("matched_keywords", []), ensure_ascii=False),
+                    json.dumps(article.get("matched_fields", []), ensure_ascii=False),
+                ),
+            )
+        except sqlite3.IntegrityError:
+            existing = db.execute(
+                "SELECT id FROM articles "
+                "WHERE run_id = ? AND topic_id = ? AND content_hash = ?",
+                (article["run_id"], article["topic_id"], article["content_hash"]),
+            ).fetchone()
+            if existing is None:
+                raise
+            article_id = existing["id"]
+        else:
+            with suppress(sqlite3.OperationalError):
                 db.execute(
-                    """INSERT INTO articles
-                (id, run_id, topic_id, source_id, title, url, excerpt, full_text,
-                 summary, analysis, score, published_at, created_at, content_hash,
-                 analysis_mode, model, matched_keywords_json, matched_fields_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    "INSERT INTO article_fts(id, title, excerpt, summary, analysis) "
+                    "VALUES (?, ?, ?, ?, ?)",
                     (
                         article_id,
-                        article["run_id"],
-                        article["topic_id"],
-                        article["source_id"],
                         article["title"],
-                        article["url"],
                         article.get("excerpt", ""),
-                        article.get("full_text", ""),
                         article.get("summary", ""),
                         article.get("analysis", ""),
-                        article.get("score"),
-                        article.get("published_at"),
-                        utc_now(),
-                        article["content_hash"],
-                        article.get("analysis_mode", "rules"),
-                        article.get("model"),
-                        json.dumps(article.get("matched_keywords", []), ensure_ascii=False),
-                        json.dumps(article.get("matched_fields", []), ensure_ascii=False),
                     ),
                 )
-            except sqlite3.IntegrityError:
-                existing = db.execute(
-                    "SELECT id FROM articles "
-                    "WHERE run_id = ? AND topic_id = ? AND content_hash = ?",
-                    (article["run_id"], article["topic_id"], article["content_hash"]),
-                ).fetchone()
-                if existing is None:
-                    raise
-                article_id = existing["id"]
-            else:
-                with suppress(sqlite3.OperationalError):
-                    db.execute(
-                        "INSERT INTO article_fts(id, title, excerpt, summary, analysis) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (
-                            article_id,
-                            article["title"],
-                            article.get("excerpt", ""),
-                            article.get("summary", ""),
-                            article.get("analysis", ""),
-                        ),
-                    )
-        return self.get_article(article_id)
+        return str(article_id)
+
+    def insert_articles(self, articles: Sequence[dict[str, Any]]) -> list[str]:
+        """Insert one report and its search rows in a single transaction."""
+
+        article_ids: list[str] = []
+        seen_ids: set[str] = set()
+        with self.connect() as db:
+            for article in articles:
+                article_id = self._insert_article_in_connection(db, article)
+                if article_id not in seen_ids:
+                    seen_ids.add(article_id)
+                    article_ids.append(article_id)
+        return article_ids
+
+    def insert_article(self, article: dict[str, Any]) -> dict[str, Any]:
+        article_ids = self.insert_articles([article])
+        if not article_ids:  # pragma: no cover - a non-empty input always resolves one row
+            raise sqlite3.IntegrityError("文章未写入")
+        return self.get_article(article_ids[0])
 
     @staticmethod
     def _article(row: sqlite3.Row) -> dict[str, Any]:
@@ -1574,6 +1750,13 @@ class Database:
         source_records, topic_records, run_records, article_records = _validated_import_records(
             configuration, articles, runs
         )
+        portable_settings = _portable_settings(configuration)
+        local_settings = self.get_settings().model_dump()
+        changed_settings = [
+            field
+            for field, incoming in portable_settings.items()
+            if local_settings.get(field) != incoming
+        ]
 
         with self.connect() as db:
             source_rows = db.execute("SELECT id, name, url, user_modified FROM sources").fetchall()
@@ -1654,6 +1837,7 @@ class Database:
                 topic_map[record["id"]] = destination_id
 
             run_rows = {row["id"]: row for row in db.execute("SELECT * FROM runs ORDER BY id")}
+            run_map: dict[str, str] = {}
             runs_new = 0
             runs_matched = 0
             runs_remapped = 0
@@ -1661,12 +1845,15 @@ class Database:
                 expected_run = self._expected_import_run(record, topic_map)
                 existing_run = run_rows.get(record["id"])
                 if self._import_run_matches(existing_run, expected_run):
+                    run_map[record["id"]] = record["id"]
                     runs_matched += 1
                     continue
                 if existing_run is None:
+                    run_map[record["id"]] = record["id"]
                     runs_new += 1
                     continue
                 remapped_id = self._remapped_import_run_id(record["id"], expected_run)
+                run_map[record["id"]] = remapped_id
                 remapped_run = run_rows.get(remapped_id)
                 if remapped_run is not None:
                     if not self._import_run_matches(remapped_run, expected_run):
@@ -1676,10 +1863,21 @@ class Database:
                 runs_new += 1
                 runs_remapped += 1
 
-            seen_pairs = {
-                (row["topic_id"], row["content_hash"])
-                for row in db.execute("SELECT topic_id, content_hash FROM articles")
-            }
+            if run_records:
+                seen_article_keys: set[tuple[str, ...]] = {
+                    (row["run_id"], row["topic_id"], row["content_hash"])
+                    for row in db.execute(
+                        "SELECT run_id, topic_id, content_hash FROM articles"
+                    )
+                }
+            else:
+                # Legacy v1 exports had no run records. Keep their historical
+                # topic/content merge behavior when all articles must share a
+                # newly-created synthetic import run.
+                seen_article_keys = {
+                    (row["topic_id"], row["content_hash"])
+                    for row in db.execute("SELECT topic_id, content_hash FROM articles")
+                }
             articles_new = 0
             articles_matched = 0
             for record in article_records:
@@ -1703,14 +1901,24 @@ class Database:
                 if source_id is None:
                     raise ValueError("备份文章引用了不存在的新闻源")
 
-                pair = (topic_id, record["content_hash"])
-                if pair in seen_pairs:
+                if run_records:
+                    article_key = (
+                        run_map[record["run_id"]],
+                        topic_id,
+                        record["content_hash"],
+                    )
+                else:
+                    article_key = (topic_id, record["content_hash"])
+                if article_key in seen_article_keys:
                     articles_matched += 1
                 else:
-                    seen_pairs.add(pair)
+                    seen_article_keys.add(article_key)
                     articles_new += 1
 
-        warnings = ["本机全局设置优先；备份中的 DeepSeek API Key 不会导入。"]
+        warnings = [
+            "默认保留本机全局设置；可在确认时选择恢复便携设置。"
+            "DeepSeek API Key、连接状态和新手引导状态永远不会导入。"
+        ]
         topic_limit_conflict = projected_active > 10
         if topic_limit_conflict:
             warnings.append("导入后活动主题将超过 10 个，应用前需要归档部分主题。")
@@ -1748,10 +1956,25 @@ class Database:
                 "articles": article_summary,
             },
             "conflicts": {"topic_limit": topic_limit_conflict},
+            "portable_settings": {
+                "available": bool(portable_settings),
+                "fields": list(portable_settings),
+                "changed_fields": changed_settings,
+                "default_action": "keep_local",
+                "excluded_fields": [
+                    "onboarding_completed",
+                    "deepseek_status",
+                    "deepseek_last_tested_at",
+                    "deepseek_last_error",
+                    "deepseek_api_key",
+                ],
+            },
             "warnings": warnings,
         }
 
-    def import_backup(self, bundle: dict[str, Any]) -> dict[str, Any]:
+    def import_backup(
+        self, bundle: dict[str, Any], *, import_portable_settings: bool = False
+    ) -> dict[str, Any]:
         """Atomically merge a validated v1/v2 backup; local global settings win."""
 
         if not isinstance(bundle, dict):
@@ -1762,17 +1985,25 @@ class Database:
             raise ValueError("备份 configuration 和 history 必须是对象")
         incoming_articles = history.get("articles", [])
         incoming_runs = history.get("runs", [])
-        return self._apply_validated_import(configuration, incoming_articles, incoming_runs)
+        return self._apply_validated_import(
+            configuration,
+            incoming_articles,
+            incoming_runs,
+            import_portable_settings=import_portable_settings,
+        )
 
     def _apply_validated_import(
         self,
         configuration: dict[str, Any],
         articles: list[dict[str, Any]],
         runs: list[dict[str, Any]],
+        *,
+        import_portable_settings: bool = False,
     ) -> dict[str, Any]:
         source_records, topic_records, run_records, article_records = _validated_import_records(
             configuration, articles, runs
         )
+        portable_settings = _portable_settings(configuration)
         result: dict[str, Any] = {
             "sources_added": 0,
             "sources_matched": 0,
@@ -1786,6 +2017,9 @@ class Database:
             "favorites_merged": 0,
             "latest_imported_run_id": None,
             "run_id": None,
+            "portable_settings_requested": bool(import_portable_settings),
+            "portable_settings_applied": False,
+            "portable_settings_changed": [],
         }
         source_map: dict[str, str] = {}
         topic_map: dict[str, str] = {}
@@ -1795,6 +2029,25 @@ class Database:
         now = utc_now()
 
         with self.connect() as db:
+            if import_portable_settings and portable_settings:
+                row = db.execute("SELECT payload FROM settings WHERE id = 1").fetchone()
+                current_settings = Settings.model_validate_json(
+                    row["payload"] if row else Settings().model_dump_json()
+                )
+                current_values = current_settings.model_dump()
+                changed_fields = [
+                    field
+                    for field, incoming in portable_settings.items()
+                    if current_values.get(field) != incoming
+                ]
+                restored_settings = Settings.model_validate(current_values | portable_settings)
+                db.execute(
+                    "UPDATE settings SET payload = ?, updated_at = ? WHERE id = 1",
+                    (restored_settings.model_dump_json(), now),
+                )
+                result["portable_settings_applied"] = True
+                result["portable_settings_changed"] = changed_fields
+
             source_by_url: dict[str, sqlite3.Row | dict[str, Any]] = {}
             source_names: dict[str, set[str]] = {}
             for row in db.execute("SELECT id, name, url, user_modified FROM sources"):
@@ -2003,12 +2256,20 @@ class Database:
                 if run_records:
                     run_id = run_map[record["run_id"]]
                     imported_runs_with_articles.add(run_id)
-
-                existing = db.execute(
-                    """SELECT id, favorite FROM articles
-                    WHERE topic_id = ? AND content_hash = ? ORDER BY created_at LIMIT 1""",
-                    (topic_id, record["content_hash"]),
-                ).fetchone()
+                    existing = db.execute(
+                        """SELECT id, favorite FROM articles
+                        WHERE run_id = ? AND topic_id = ? AND content_hash = ?
+                        ORDER BY created_at LIMIT 1""",
+                        (run_id, topic_id, record["content_hash"]),
+                    ).fetchone()
+                else:
+                    # Legacy v1 exports had no run records and are merged into
+                    # one synthetic run, so retain their topic/content identity.
+                    existing = db.execute(
+                        """SELECT id, favorite FROM articles
+                        WHERE topic_id = ? AND content_hash = ? ORDER BY created_at LIMIT 1""",
+                        (topic_id, record["content_hash"]),
+                    ).fetchone()
                 if existing:
                     result["articles_matched"] += 1
                     if record["favorite"] and not bool(existing["favorite"]):
@@ -2132,6 +2393,8 @@ class Database:
         configuration: dict[str, Any],
         articles: list[dict[str, Any]],
         runs: list[dict[str, Any]] | None = None,
+        *,
+        import_portable_settings: bool = False,
     ) -> dict[str, Any]:
         """Compatibility facade for the API's preview/apply import contract."""
 
@@ -2139,7 +2402,8 @@ class Database:
             {
                 "configuration": configuration,
                 "history": {"articles": articles, "runs": runs or []},
-            }
+            },
+            import_portable_settings=import_portable_settings,
         )
 
     def export_runs(self) -> list[dict[str, Any]]:
