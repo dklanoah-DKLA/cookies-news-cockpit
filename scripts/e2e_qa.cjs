@@ -13,7 +13,7 @@ const playwrightModule = process.env.CODEX_PLAYWRIGHT_ROOT || "playwright";
 const { chromium } = require(playwrightModule);
 const outputDir = path.resolve(process.env.E2E_QA_OUTPUT || path.join(projectRoot, "artifacts", "e2e-qa"));
 const sessionToken = `e2e-${process.pid}-${Date.now()}`;
-const report = { status: "running", checks: [], externalRequests: [], requestFailures: [], consoleErrors: [], pageErrors: [] };
+const report = { status: "running", checks: [], externalRequests: [], requestFailures: [], consoleErrors: [], pageErrors: [], expectedFaults: [] };
 
 function check(name, detail = "pass") {
   report.checks.push({ name, status: "pass", detail });
@@ -118,6 +118,37 @@ async function apiRequest(page, method, endpoint, body) {
   return result.body;
 }
 
+async function keywordWords(page, kind = "keyword") {
+  const label = kind === "keyword" ? "编辑关键词：" : "编辑排除词：";
+  return page.locator(`#topic-${kind}-chips button[aria-label^="${label}"]`).evaluateAll(
+    (buttons, prefix) => buttons.map((button) => button.getAttribute("aria-label").slice(prefix.length)), label,
+  );
+}
+
+async function clearKeywordDraft(page, kind = "keyword") {
+  const label = kind === "keyword" ? "删除关键词：" : "删除排除词：";
+  const buttons = page.locator(`#topic-${kind}-chips button[aria-label^="${label}"]`);
+  while (await buttons.count()) await buttons.first().click();
+}
+
+async function pasteKeywordText(page, text, kind = "keyword") {
+  // The editor uses a textarea: exercise the complete pasted multiline value
+  // without changing the operating system clipboard in an acceptance test.
+  await page.locator(`#topic-${kind}-entry`).fill(text);
+  await page.locator(`#topic-${kind}-add`).click();
+}
+
+async function confirmTopicClose(page, action, accept = true) {
+  const confirmationPromise = page.waitForEvent("dialog");
+  const actionPromise = action();
+  const confirmation = await confirmationPromise;
+  assert.equal(confirmation.type(), "confirm");
+  assert.match(confirmation.message(), /未保存|放弃|草稿/);
+  if (accept) await confirmation.accept();
+  else await confirmation.dismiss();
+  await actionPromise;
+}
+
 async function waitForFinishedRun(page, previousId = null) {
   await page.waitForFunction(async ({ previousId, token }) => {
     const response = await fetch("/api/runs/current", { headers: { "X-Cockpit-Token": token } });
@@ -157,8 +188,11 @@ async function main() {
     browser = await chromium.launch(browserOptions());
     const context = await browser.newContext({ acceptDownloads: true, viewport: { width: 1280, height: 900 } });
     const page = await context.newPage();
+    const expectedFaultUrls = new Set();
     page.on("console", (message) => {
-      if (message.type() === "error") report.consoleErrors.push(message.text());
+      if (message.type() !== "error") return;
+      if (expectedFaultUrls.has(message.location().url) && /409/.test(message.text())) return;
+      report.consoleErrors.push(message.text());
     });
     page.on("pageerror", (error) => report.pageErrors.push(error.message));
     page.on("request", (request) => {
@@ -166,7 +200,11 @@ async function main() {
       if (!["127.0.0.1", "localhost"].includes(hostname)) report.externalRequests.push(request.url());
     });
     page.on("response", (response) => {
-      if (response.status() >= 400) report.requestFailures.push({ url: response.url(), status: response.status() });
+      if (response.status() < 400) return;
+      const failure = { url: response.url(), status: response.status() };
+      if (expectedFaultUrls.has(response.url()) && response.status() === 409 && response.headers()["x-e2e-expected-fault"] === "keyword-save") {
+        report.expectedFaults.push(failure);
+      } else report.requestFailures.push(failure);
     });
 
     await runCheck("会话令牌清除并连接本地服务", async () => {
@@ -241,8 +279,9 @@ async function main() {
       assert.equal(await page.locator("#topic-threshold").isDisabled(), true);
       assert.equal(await page.locator("#topic-limit").isDisabled(), true);
       await page.locator("#topic-name").fill(topicName);
-      await page.locator("#topic-keywords").fill("机器人, 具身智能, robot");
-      assert.equal(await page.locator("#topic-keywords").inputValue(), "机器人, 具身智能, robot");
+      await page.locator("#topic-keyword-entry").fill("机器人, 具身智能, robot");
+      await page.locator("#topic-keyword-add").click();
+      assert.deepEqual(await keywordWords(page), ["机器人", "具身智能", "robot"]);
       const formValidity = await page.locator("#topic-form").evaluate((form) => ({
         valid: form.checkValidity(),
         invalid: [...form.querySelectorAll(":invalid")].map((field) => ({
@@ -300,6 +339,345 @@ async function main() {
       assert.equal(topic.threshold, null);
       assert.equal(topic.article_limit, null);
       return "83/7 可保存，重新勾选后 null 往返正常";
+    });
+
+    const topicRow = () => page.locator("#topic-sheet .topic-grid").filter({ hasText: topicName });
+    const savedEditorTopic = async () => (await apiJson(page, "/api/topics")).body.topics.find((topic) => topic.name === topicName);
+
+    await runCheck("关键词标签逐词添加、编辑、删除及未添加输入保存后持久化", async () => {
+      const before = await savedEditorTopic();
+      const unrelated = (await apiJson(page, "/api/topics")).body.topics.filter((topic) => topic.id !== before.id);
+      await topicRow().getByRole("button", { name: "编辑", exact: true }).click();
+      await clearKeywordDraft(page);
+      await page.locator("#topic-keyword-entry").fill("银行");
+      await page.locator("#topic-keyword-entry").press("Enter");
+      assert.equal(await page.locator("#topic-dialog").evaluate((dialog) => dialog.open), true);
+      await page.locator("#topic-keyword-entry").fill("资本充足率");
+      await page.locator("#topic-keyword-add").click();
+      await page.locator("#topic-keyword-entry").fill("临时词");
+      await page.locator("#topic-keyword-add").click();
+      await page.getByRole("button", { name: "删除关键词：临时词", exact: true }).click();
+      await page.getByRole("button", { name: "编辑关键词：资本充足率", exact: true }).click();
+      assert.equal(await page.locator("#topic-keyword-entry").inputValue(), "资本充足率");
+      assert.match(await page.locator("#topic-keyword-add").textContent(), /更新/);
+      await page.locator("#topic-keyword-entry").fill("不应生效的编辑");
+      await page.locator("#topic-keyword-cancel-edit").click();
+      assert.deepEqual(await keywordWords(page), ["银行", "资本充足率"]);
+      await page.getByRole("button", { name: "编辑关键词：资本充足率", exact: true }).click();
+      await page.locator("#topic-keyword-entry").fill("capital adequacy");
+      await page.locator("#topic-keyword-add").click();
+      await page.locator("#topic-exclude-entry").fill("招聘，广告");
+      await page.locator("#topic-exclude-add").click();
+      await page.getByRole("button", { name: "编辑排除词：招聘", exact: true }).click();
+      await page.locator("#topic-exclude-entry").fill("赞助");
+      await page.locator("#topic-exclude-add").click();
+      await page.getByRole("button", { name: "删除排除词：广告", exact: true }).click();
+      assert.deepEqual(await savedEditorTopic(), before);
+      // Saving includes both pending inputs, even without pressing the add buttons.
+      await page.locator("#topic-keyword-entry").fill("payments");
+      await page.locator("#topic-exclude-entry").fill("广告");
+      await page.locator("#topic-form [type=submit]").click();
+      await page.locator("#topic-dialog").waitFor({ state: "hidden" });
+      const saved = await savedEditorTopic();
+      assert.deepEqual(saved.keywords, ["银行", "capital adequacy", "payments"]);
+      assert.deepEqual(saved.exclusion_keywords, ["赞助", "广告"]);
+      assert.deepEqual(saved.source_ids, before.source_ids);
+      assert.deepEqual((await apiJson(page, "/api/topics")).body.topics.filter((topic) => topic.id !== before.id), unrelated);
+      await page.reload({ waitUntil: "networkidle" });
+      await topicRow().getByRole("button", { name: "编辑", exact: true }).click();
+      assert.deepEqual(await keywordWords(page), saved.keywords);
+      assert.deepEqual(await keywordWords(page, "exclude"), saved.exclusion_keywords);
+      await page.locator("#topic-dialog").getByRole("button", { name: "取消", exact: true }).click();
+      return "标签操作只改草稿；保存自动接纳待添加词，重开与刷新仍一致，其他主题和来源绑定不变";
+    });
+
+    await runCheck("粘贴与批量合并支持全部分隔符并保留短语及去重", async () => {
+      await topicRow().getByRole("button", { name: "编辑", exact: true }).click();
+      await clearKeywordDraft(page);
+      await clearKeywordDraft(page, "exclude");
+      await pasteKeywordText(page, "银行，capital adequacy,AML、aml;支付；跨境\n流动性\r\n银行");
+      assert.deepEqual(await keywordWords(page), ["银行", "capital adequacy", "AML", "支付", "跨境", "流动性"]);
+      await page.locator("#topic-keyword-bulk-toggle > summary").click();
+      await page.locator("#topic-keyword-bulk").fill("资本充足率;风险管理\n资本充足率");
+      await page.locator("#topic-keyword-bulk-add").click();
+      const expected = ["银行", "capital adequacy", "AML", "支付", "跨境", "流动性", "资本充足率", "风险管理"];
+      assert.deepEqual(await keywordWords(page), expected);
+      await pasteKeywordText(page, "广告，赞助,招聘、广告;推广；软文\n非银行\r\n赞助", "exclude");
+      const excludes = ["广告", "赞助", "招聘", "推广", "软文", "非银行"];
+      assert.deepEqual(await keywordWords(page, "exclude"), excludes);
+      await page.locator("#topic-form [type=submit]").click();
+      await page.locator("#topic-dialog").waitFor({ state: "hidden" });
+      assert.deepEqual((await savedEditorTopic()).keywords, expected);
+      assert.deepEqual((await savedEditorTopic()).exclusion_keywords, excludes);
+      return "多行粘贴值中的逗号/顿号/分号/换行均识别；大小写去重，capital adequacy内部空格不拆词";
+    });
+
+    await runCheck("包含词与排除词40项边界原子校验，超限草稿不截断", async () => {
+      const before = await savedEditorTopic();
+      await topicRow().getByRole("button", { name: "编辑", exact: true }).click();
+      for (const kind of ["keyword", "exclude"]) {
+        await clearKeywordDraft(page, kind);
+        const toggle = page.locator(`#topic-${kind}-bulk-toggle`);
+        if (!(await toggle.evaluate((details) => details.open))) await toggle.locator("summary").click();
+        const values = Array.from({ length: 41 }, (_, index) => `${kind}银行词${index + 1}`);
+        const bulk = page.locator(`#topic-${kind}-bulk`);
+        await bulk.fill(values.join("\n"));
+        await page.locator(`#topic-${kind}-bulk-add`).click();
+        assert.deepEqual(await keywordWords(page, kind), []);
+        assert.equal(await bulk.inputValue(), values.join("\n"));
+        assert.equal(await bulk.getAttribute("aria-invalid"), "true");
+        assert.match(await page.locator("#topic-form").textContent(), /40/);
+        // Duplicate input does not consume an extra slot.
+        await bulk.fill([...values.slice(0, 40), values[0]].join("，"));
+        await page.locator(`#topic-${kind}-bulk-add`).click();
+        assert.deepEqual(await keywordWords(page, kind), values.slice(0, 40));
+        const entry = page.locator(`#topic-${kind}-entry`);
+        await entry.fill(values[40]);
+        await page.locator(`#topic-${kind}-add`).click();
+        assert.equal(await entry.inputValue(), values[40]);
+        assert.equal(await entry.getAttribute("aria-invalid"), "true");
+        assert.deepEqual(await keywordWords(page, kind), values.slice(0, 40));
+        await entry.fill(values[0]);
+        await page.locator(`#topic-${kind}-add`).click();
+        assert.equal(await entry.inputValue(), "");
+        assert.deepEqual(await keywordWords(page, kind), values.slice(0, 40));
+      }
+      assert.deepEqual(await savedEditorTopic(), before);
+      await page.locator("#topic-form [type=submit]").click();
+      await page.locator("#topic-dialog").waitFor({ state: "hidden" });
+      const saved = await savedEditorTopic();
+      assert.equal(saved.keywords.length, 40);
+      assert.equal(saved.exclusion_keywords.length, 40);
+      await topicRow().getByRole("button", { name: "编辑", exact: true }).click();
+      assert.deepEqual(await keywordWords(page), saved.keywords);
+      assert.deepEqual(await keywordWords(page, "exclude"), saved.exclusion_keywords);
+      await page.locator("#topic-dialog").getByRole("button", { name: "取消", exact: true }).click();
+      return "41项整批拒绝且原文保留；去重后40项允许，不能静默截断包含词或排除词";
+    });
+
+    await runCheck("中文输入法Enter不提交、编辑中合成Escape不丢草稿，取消放弃不写数据库", async () => {
+      const before = await savedEditorTopic();
+      await topicRow().getByRole("button", { name: "编辑", exact: true }).click();
+      await clearKeywordDraft(page);
+      const entry = page.locator("#topic-keyword-entry");
+      await entry.dispatchEvent("compositionstart", { data: "yin" });
+      await entry.fill("银行");
+      await entry.evaluate((input) => input.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "Enter", code: "Enter", keyCode: 229, isComposing: true, bubbles: true, cancelable: true,
+      })));
+      assert.deepEqual(await keywordWords(page), []);
+      assert.equal(await page.locator("#topic-dialog").evaluate((dialog) => dialog.open), true);
+      assert.deepEqual(await savedEditorTopic(), before);
+      await entry.dispatchEvent("compositionend", { data: "银行" });
+      await entry.press("Enter");
+      assert.deepEqual(await keywordWords(page), ["银行"]);
+      assert.equal(await page.locator("#topic-dialog").evaluate((dialog) => dialog.open), true);
+      await page.getByRole("button", { name: "编辑关键词：银行", exact: true }).click();
+      await entry.dispatchEvent("compositionstart", { data: "yin hang feng" });
+      await entry.fill("银行风险草稿");
+      for (const composition of [
+        { keyCode: 229, isComposing: true },
+        // Some IMEs clear the event flag while the composition session is active.
+        { keyCode: 27, isComposing: false },
+      ]) {
+        await entry.evaluate((input, composition) => input.dispatchEvent(new KeyboardEvent("keydown", {
+          key: "Escape", code: "Escape", bubbles: true, cancelable: true, ...composition,
+        })), composition);
+        assert.equal(await entry.inputValue(), "银行风险草稿");
+        assert.deepEqual(await keywordWords(page), ["银行"]);
+        assert.equal(await page.locator("#topic-keyword-cancel-edit").isVisible(), true);
+        assert.equal(await page.locator("#topic-dialog").evaluate((dialog) => dialog.open), true);
+        assert.deepEqual(await savedEditorTopic(), before);
+      }
+      await entry.dispatchEvent("compositionend", { data: "银行风险草稿" });
+      await entry.press("Escape");
+      assert.equal(await entry.inputValue(), "");
+      assert.deepEqual(await keywordWords(page), ["银行"]);
+      assert.equal(await page.locator("#topic-keyword-cancel-edit").isHidden(), true);
+      assert.equal(await page.locator("#topic-dialog").evaluate((dialog) => dialog.open), true);
+      await confirmTopicClose(page, () => page.keyboard.press("Escape"), false);
+      assert.equal(await page.locator("#topic-dialog").evaluate((dialog) => dialog.open), true);
+      assert.deepEqual(await keywordWords(page), ["银行"]);
+      await confirmTopicClose(page, () => page.keyboard.press("Escape"));
+      await page.locator("#topic-dialog").waitFor({ state: "hidden" });
+      assert.deepEqual(await savedEditorTopic(), before);
+      await topicRow().getByRole("button", { name: "编辑", exact: true }).click();
+      assert.deepEqual(await keywordWords(page), before.keywords);
+      await clearKeywordDraft(page);
+      await page.locator("#topic-keyword-entry").fill("尚未添加的草稿");
+      await confirmTopicClose(page, () => page.locator("#topic-dialog").getByRole("button", { name: "取消", exact: true }).click());
+      assert.deepEqual(await savedEditorTopic(), before);
+      return "合成Enter不提交；编辑中合成Escape及仅composition状态均保留原词/草稿；普通Escape取消编辑，放弃确认边界正确";
+    });
+
+    await runCheck("主题保存失败内联提示并保留草稿，可重试且只成功写入一次", async () => {
+      const before = await savedEditorTopic();
+      const endpoint = `${baseUrl}/api/topics/${before.id}`;
+      let intercepted = 0;
+      let successfulWrites = 0;
+      const listener = (response) => {
+        if (response.url() === endpoint && response.request().method() === "PUT" && response.status() === 200) successfulWrites += 1;
+      };
+      const handler = async (route) => {
+        if (route.request().method() !== "PUT") return route.continue();
+        intercepted += 1;
+        await route.fulfill({ status: 409, contentType: "application/json", headers: { "x-e2e-expected-fault": "keyword-save" }, body: JSON.stringify({ detail: "E2E 模拟暂时无法保存，请重试" }) });
+      };
+      expectedFaultUrls.add(endpoint);
+      page.on("response", listener);
+      await page.route(endpoint, handler);
+      try {
+        await topicRow().getByRole("button", { name: "编辑", exact: true }).click();
+        await clearKeywordDraft(page);
+        await clearKeywordDraft(page, "exclude");
+        await page.locator("#topic-keyword-entry").fill("银行，风险管理");
+        await page.locator("#topic-exclude-entry").fill("广告");
+        await page.locator("#topic-form [type=submit]").click();
+        await page.locator("#topic-save-error").waitFor({ state: "visible" });
+        assert.equal(await page.locator("#topic-save-error").getAttribute("role"), "alert");
+        assert.match(await page.locator("#topic-save-error").textContent(), /E2E 模拟暂时无法保存/);
+        assert.equal(await page.locator("#topic-dialog").evaluate((dialog) => dialog.open), true);
+        assert.deepEqual(await keywordWords(page), ["银行", "风险管理"]);
+        assert.deepEqual(await keywordWords(page, "exclude"), ["广告"]);
+        assert.deepEqual(await savedEditorTopic(), before);
+        assert.equal(intercepted, 1);
+        assert.equal(successfulWrites, 0);
+        await page.unroute(endpoint, handler);
+        await page.locator("#topic-form [type=submit]").click();
+        await page.locator("#topic-dialog").waitFor({ state: "hidden" });
+        const saved = await savedEditorTopic();
+        assert.deepEqual(saved.keywords, ["银行", "风险管理"]);
+        assert.deepEqual(saved.exclusion_keywords, ["广告"]);
+        assert.equal(successfulWrites, 1);
+      } finally {
+        await page.unroute(endpoint, handler);
+        page.off("response", listener);
+      }
+      return "仅一次显式409故障注入；内联错误可见，草稿和数据库边界正确，恢复后单次PUT成功";
+    });
+
+    await runCheck("延迟保存期间所有控件及后台刷新重建的来源保持禁用，保存后恢复可编辑", async () => {
+      const before = await savedEditorTopic();
+      const endpoint = `${baseUrl}/api/topics/${before.id}`;
+      let releaseSave;
+      let intercepted = 0;
+      const saveGate = new Promise((resolve) => { releaseSave = resolve; });
+      const handler = async (route) => {
+        if (route.request().method() !== "PUT") return route.continue();
+        intercepted += 1;
+        await saveGate;
+        await route.continue();
+      };
+      const controlStates = () => page.locator("#topic-form input, #topic-form textarea, #topic-form select, #topic-form button")
+        .evaluateAll((controls) => controls.map((control) => ({ id: control.id || control.name || control.type, disabled: control.disabled })));
+      await page.route(endpoint, handler);
+      try {
+        await topicRow().getByRole("button", { name: "编辑", exact: true }).click();
+        await page.locator("#topic-keyword-entry").fill("存款保险");
+        const selectedSources = await page.locator("#topic-source-options input:checked").evaluateAll((inputs) => inputs.map((input) => input.value));
+        const originalSource = await page.locator("#topic-source-options input").first().elementHandle();
+        assert.ok(originalSource);
+        const pendingRequest = page.waitForRequest((request) => request.url() === endpoint && request.method() === "PUT");
+        await page.locator("#topic-form [type=submit]").click();
+        await pendingRequest;
+        assert.equal(await page.locator("#topic-form").getAttribute("aria-busy"), "true");
+        let controls = await controlStates();
+        assert.ok(controls.length > 20);
+        assert.deepEqual(controls.filter((control) => !control.disabled), []);
+        assert.deepEqual(await savedEditorTopic(), before);
+        // Invoke the existing refresh event handler while the PUT is held. This
+        // exercises the real bootstrap/render path without reloading/discarding.
+        const bootstrapResponse = page.waitForResponse((response) => response.url() === `${baseUrl}/api/bootstrap` && response.status() === 200);
+        await page.locator("#retry-bootstrap").evaluate((button) => button.click());
+        await bootstrapResponse;
+        await page.waitForFunction((original) => !original.isConnected, originalSource);
+        controls = await controlStates();
+        assert.deepEqual(controls.filter((control) => !control.disabled), []);
+        assert.deepEqual(await page.locator("#topic-source-options input:checked").evaluateAll((inputs) => inputs.map((input) => input.value)), selectedSources);
+        assert.equal(await page.locator("#topic-dialog").evaluate((dialog) => dialog.open), true);
+        assert.deepEqual(await keywordWords(page), [...before.keywords, "存款保险"]);
+        assert.deepEqual(await savedEditorTopic(), before);
+        releaseSave();
+        await page.locator("#topic-dialog").waitFor({ state: "hidden" });
+        await page.waitForFunction(() => document.querySelector("#topic-form").getAttribute("aria-busy") === "false");
+        const saved = await savedEditorTopic();
+        assert.deepEqual(saved.keywords, [...before.keywords, "存款保险"]);
+        assert.deepEqual(saved.source_ids, before.source_ids);
+        assert.equal(intercepted, 1);
+        await topicRow().getByRole("button", { name: "编辑", exact: true }).click();
+        for (const selector of ["#topic-name", "#topic-keyword-entry", "#topic-exclude-entry", "#topic-keyword-add", "#topic-exclude-add", "#suggest-topic", "#topic-form [type=submit]"]) {
+          assert.equal(await page.locator(selector).isEnabled(), true, `${selector} must unlock after save`);
+        }
+        assert.ok(await page.locator("#topic-source-options input:enabled").count() > 0);
+        assert.deepEqual(await keywordWords(page), saved.keywords);
+        await page.locator("#topic-name").fill(saved.name);
+        await page.locator("#topic-dialog").getByRole("button", { name: "取消", exact: true }).click();
+        assert.deepEqual(await savedEditorTopic(), saved);
+      } finally {
+        releaseSave();
+        await page.unroute(endpoint, handler);
+      }
+      return "PUT被受控延迟时全表单禁用；真实bootstrap重建来源后仍禁用且绑定不变；单次保存后重开恢复编辑";
+    });
+
+    await runCheck("AI关键词须预览确认，修改草稿使旧建议失效，确认仅改草稿不自动保存", async () => {
+      const before = await savedEditorTopic();
+      const topicsBefore = (await apiJson(page, "/api/topics")).body.topics;
+      const endpoint = `${baseUrl}/api/topics/suggest`;
+      let suggestions = 0;
+      const handler = async (route) => {
+        suggestions += 1;
+        assert.equal(route.request().method(), "POST");
+        const body = route.request().postDataJSON();
+        assert.deepEqual(body.keywords, before.keywords);
+        assert.deepEqual(body.exclusion_keywords, before.exclusion_keywords);
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+          suggestion: { keywords: [...before.keywords, "Basel III", "资本充足率"], rationale: "E2E 离线建议，只供用户确认" },
+        }) });
+      };
+      await page.route(endpoint, handler);
+      // This is the fixture's in-memory key store, never the user's keychain.
+      await apiRequest(page, "PUT", "/api/settings/deepseek-key", { api_key: "e2e-fake-key-not-real" });
+      try {
+        await page.reload({ waitUntil: "networkidle" });
+        await topicRow().getByRole("button", { name: "编辑", exact: true }).click();
+        await page.locator("#suggest-topic").click();
+        await page.locator("#topic-suggestion").waitFor({ state: "visible" });
+        assert.deepEqual(await keywordWords(page), before.keywords);
+        assert.deepEqual((await apiJson(page, "/api/topics")).body.topics, topicsBefore);
+        await page.locator("#apply-topic-suggestion").click();
+        assert.deepEqual(await keywordWords(page), [...before.keywords, "Basel III", "资本充足率"]);
+        assert.deepEqual((await apiJson(page, "/api/topics")).body.topics, topicsBefore);
+        await confirmTopicClose(page, () => page.locator("#topic-dialog").getByRole("button", { name: "取消", exact: true }).click());
+        assert.deepEqual((await apiJson(page, "/api/topics")).body.topics, topicsBefore);
+        await topicRow().getByRole("button", { name: "编辑", exact: true }).click();
+        assert.deepEqual(await keywordWords(page), before.keywords);
+        await page.locator("#topic-dialog").getByRole("button", { name: "取消", exact: true }).click();
+        for (const change of ["name", "keywords"]) {
+          await topicRow().getByRole("button", { name: "编辑", exact: true }).click();
+          await page.locator("#suggest-topic").click();
+          await page.locator("#topic-suggestion").waitFor({ state: "visible" });
+          if (change === "name") await page.locator("#topic-name").fill(`${before.name} 草稿`);
+          else await pasteKeywordText(page, "流动性风险");
+          const wordsBeforeApply = await keywordWords(page);
+          await page.locator("#apply-topic-suggestion").click();
+          await page.locator("#topic-save-error").waitFor({ state: "visible" });
+          assert.match(await page.locator("#topic-save-error").textContent(), /重新生成/);
+          assert.equal(await page.locator("#topic-suggestion").isHidden(), true);
+          assert.deepEqual(await keywordWords(page), wordsBeforeApply);
+          assert.equal(wordsBeforeApply.includes("Basel III"), false);
+          assert.equal(wordsBeforeApply.includes("资本充足率"), false);
+          assert.deepEqual((await apiJson(page, "/api/topics")).body.topics, topicsBefore);
+          await confirmTopicClose(page, () => page.locator("#topic-dialog").getByRole("button", { name: "取消", exact: true }).click());
+          assert.deepEqual((await apiJson(page, "/api/topics")).body.topics, topicsBefore);
+        }
+        assert.equal(suggestions, 3);
+      } finally {
+        await page.unroute(endpoint, handler);
+        await apiRequest(page, "DELETE", "/api/settings/deepseek-key");
+        await page.reload({ waitUntil: "networkidle" });
+      }
+      return "AI响应离线模拟；改名称或词表后旧建议均被拒绝且要求重新生成；有效确认仅改草稿，数据库与其他主题不变，假Key已清理";
     });
 
     const sourceName = `E2E 来源 ${suffix}`;
@@ -553,7 +931,7 @@ async function main() {
       assert.match(await page.locator("#toast-region").textContent(), /没有可用来源/);
       assert.equal((await apiJson(page, "/api/runs/current")).body.run?.id || null, before?.id || null);
       assert.equal((await apiJson(page, "/api/e2e/state")).body.fetch_calls.length, callsBefore);
-      await page.locator("#topic-excludes").fill("广告");
+      await page.locator("#topic-exclude-entry").fill("广告");
       await page.locator("#topic-form [type=submit]").click();
       await page.locator("#topic-dialog").waitFor({ state: "hidden" });
       const preserved = (await apiJson(page, "/api/topics")).body.topics.find((item) => item.id === regression.topic.id);
@@ -678,7 +1056,9 @@ async function main() {
       assert.deepEqual(report.requestFailures, []);
       assert.deepEqual(report.consoleErrors, []);
       assert.deepEqual(report.pageErrors, []);
-      return "所有请求仅访问 127.0.0.1；HTTP、控制台和页面异常均为空";
+      assert.equal(report.expectedFaults.length, 1);
+      assert.equal(report.expectedFaults[0].status, 409);
+      return "所有请求仅访问 127.0.0.1；仅一次标注的保存409故障注入，无意外HTTP/控制台/页面异常";
     });
 
     await page.screenshot({ path: path.join(outputDir, "e2e-final.png"), fullPage: true });

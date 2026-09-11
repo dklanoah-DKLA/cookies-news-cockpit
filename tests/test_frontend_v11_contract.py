@@ -26,6 +26,7 @@ def test_first_run_wizard_has_all_four_skippable_steps() -> None:
 def test_topic_draft_supports_exclusions_chips_and_ai_preview() -> None:
     html = _read("index.html")
     javascript = _read("app.js")
+    keyword_editor = _read("keyword-editor.js")
 
     for control in (
         "topic-keyword-count",
@@ -40,7 +41,7 @@ def test_topic_draft_supports_exclusions_chips_and_ai_preview() -> None:
         assert f'id="{control}"' in html
     assert "exclusion_keywords" in javascript
     assert "/api/topics/suggest" in javascript
-    assert "[，,、;；\\r\\n]" in javascript
+    assert "[，,、;；\\r\\n]" in keyword_editor
     assert "请至少填写一个包含关键词" in javascript
 
 

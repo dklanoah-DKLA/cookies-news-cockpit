@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>关键词编辑器 · 八态本地预览</title>
+  <link rel="stylesheet" href="../../src/cookies_news_cockpit/static/tokens.css">
+  <link rel="stylesheet" href="../../src/cookies_news_cockpit/static/app.css">
+  <link rel="stylesheet" href="../../src/cookies_news_cockpit/static/keyword-editor.css">
+  <style>
+    /* Hallmark · pre-emit critique: P5 H4 E4 S5 R5 V4
+     * component: keyword editor state preview · genre: playful · theme: cookie-white
+     * Real component, local draft data only. No persistence or API connection.
+     */
+    html, body { overflow-x: clip; }
+    body { padding: var(--space-lg) var(--space-md); }
+    .preview { width: 100%; max-width: 42rem; margin-inline: auto; display: grid; gap: var(--space-xl); }
+    .preview__intro { display: grid; gap: var(--space-xs); }
+    .preview__intro h1 { font-size: var(--text-xl); line-height: 1.2; }
+    .preview__intro p { color: var(--color-muted); font-size: var(--text-sm); }
+    .preview__state { min-width: 0; display: grid; gap: var(--space-sm); }
+    .preview__state h2 { font-size: var(--text-md); line-height: 1.3; }
+  </style>
+  <script src="../../src/cookies_news_cockpit/static/keyword-editor.js" defer></script>
+  <script defer>
+    document.addEventListener("DOMContentLoaded", () => {
+      const samples = [
+        ["default", "默认 · 可逐个编辑与删除"],
+        ["hover", "悬停 · 浅色反馈"],
+        ["focus", "键盘焦点 · 即时可见"],
+        ["active", "按下 · 保持位置"],
+        ["disabled", "禁用 · 保留已有内容"],
+        ["loading", "处理中 · 文字说明"],
+        ["error", "错误 · 原词与草稿保留"],
+        ["success", "成功 · 草稿已更新"]
+      ];
+      window.previewEditors = {};
+      for (const [state, title] of samples) {
+        const prefix = `preview-${state}`;
+        const wrapper = document.createElement("section");
+        wrapper.className = "preview__state";
+        wrapper.id = `${state}-sample`;
+        const heading = document.createElement("h2");
+        heading.textContent = title;
+        wrapper.append(heading);
+        const root = document.createElement("section");
+        root.className = "keyword-editor";
+        root.id = `${prefix}-editor`;
+        root.setAttribute("aria-labelledby", `${prefix}-label`);
+        root.innerHTML = `<h3 class="keyword-editor__heading" id="${prefix}-label">包含关键词 <span class="field-count" id="${prefix}-count">0 / 40</span></h3><textarea id="${prefix}-canonical" hidden></textarea><div class="keyword-editor__list" id="${prefix}-chips"></div>`;
+        wrapper.append(root);
+        document.getElementById("samples").append(wrapper);
+        const editor = new window.CockpitKeywordEditor({prefix, canonicalId: `${prefix}-canonical`, label: "关键词"});
+        window.previewEditors[state] = editor;
+        editor.setValues(["银行", "央行", "Bank of America", "跨境银行风险管理与审慎监管资本流动性长期跟踪关键词"]);
+        if (["hover", "focus", "active"].includes(state)) {
+          root.querySelector(".keyword-token__edit").classList.add(`is-${state}`);
+          editor.entry.classList.add(`is-${state}`);
+          editor.add.classList.add(`is-${state}`);
+        }
+        if (state === "disabled" || state === "loading") {
+          for (const control of root.querySelectorAll("button, textarea")) {
+            control.disabled = true;
+            control.setAttribute("aria-disabled", "true");
+          }
+          editor.feedback(state === "loading" ? "正在保存主题，请稍候。" : "保存期间暂不可修改，已有关键词仍保留。", state === "loading" ? "loading" : "default");
+        } else if (state === "error") {
+          editor.entry.value = "银行";
+          editor.feedback("列表里已有这个词，请换一个；原词仍保留。", "error");
+        } else if (state === "success") {
+          editor.feedback("已更新草稿；保存当前主题后生效。", "success");
+          window.clearTimeout(editor.timer);
+        }
+      }
+      document.activeElement?.blur();
+      window.scrollTo(0, 0);
+      window.previewReady = true;
+    });
+  </script>
+</head>
+<body>
+  <main class="preview" id="samples">
+    <header class="preview__intro">
+      <h1>关键词编辑器 · 八态</h1>
+      <p>本页使用实际组件，仅演示本地草稿交互；不连接 API、不保存主题。悬停、焦点与按下状态在此固定展示。</p>
+    </header>
+  </main>
+</body>
+</html>

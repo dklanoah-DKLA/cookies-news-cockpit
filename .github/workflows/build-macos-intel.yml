@@ -107,6 +107,7 @@ jobs:
             sleep 0.25
           done
           node scripts/visual_qa.cjs
+          node scripts/keyword_editor_visual_qa.cjs
 
       - name: Build, ad-hoc sign and package
         run: bash packaging/build_macos.sh
@@ -124,6 +125,8 @@ jobs:
           trap cleanup EXIT
           for attempt in {1..40}; do
             if curl --fail --silent --show-error http://127.0.0.1:38119/ | grep -q "Cookies News Cockpit"; then
+              curl --fail --silent --show-error http://127.0.0.1:38119/keyword-editor.js | grep -q "CockpitKeywordEditor"
+              curl --fail --silent --show-error http://127.0.0.1:38119/keyword-editor.css | grep -q "keyword-editor"
               exit 0
             fi
             if ! kill -0 "${smoke_pid}" 2>/dev/null; then
@@ -171,6 +174,7 @@ jobs:
           path: |
             artifacts/e2e-qa
             artifacts/visual-qa
+            artifacts/keyword-editor/visual-qa
           if-no-files-found: warn
           retention-days: 30
 

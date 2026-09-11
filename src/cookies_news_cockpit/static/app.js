@@ -61,6 +61,9 @@
     runCancelling: false,
     favoritePending: new Set(),
     topicSuggestion: null,
+    topicDraftBaseline: "",
+    topicDialogVersion: 0,
+    topicSaving: false,
     importPreview: null,
     onboardingStep: 0,
     onboardingPresented: false,
@@ -68,6 +71,8 @@
   };
 
   const refs = {};
+  let keywordEditor;
+  let excludeEditor;
 
   function captureSessionToken() {
     const hash = new URLSearchParams(window.location.hash.replace(/^#/, ""));
@@ -94,7 +99,7 @@
       "topic-sheet", "source-sheet", "source-search", "source-category-filter", "source-filter-count", "deepseek-badge", "deepseek-action", "history-filter",
       "history-query", "history-topic", "history-favorite", "history-list", "history-load-more", "dock-status", "dock-note",
       "start-run", "source-scope-warning", "search-dialog", "command-query", "command-results", "topic-dialog", "topic-form",
-      "topic-dialog-title", "topic-id", "topic-name", "topic-keywords", "topic-keyword-count", "topic-keyword-chips", "topic-excludes", "topic-exclude-count", "topic-exclude-chips",
+      "topic-dialog-title", "topic-id", "topic-name", "topic-keywords", "topic-keyword-count", "topic-keyword-chips", "topic-excludes", "topic-exclude-count", "topic-exclude-chips", "topic-save-error", "topic-draft-status",
       "topic-threshold", "topic-limit", "suggest-topic", "topic-suggestion", "topic-suggestion-copy", "topic-suggestion-chips", "apply-topic-suggestion",
       "topic-threshold-default", "topic-limit-default", "topic-source-options", "topic-enabled", "source-dialog", "source-form", "source-dialog-title",
       "source-id", "source-name", "source-homepage", "source-url", "source-category", "source-language", "source-preset", "source-terms", "source-enabled", "source-validation",
@@ -1183,7 +1188,7 @@
     }
     sources.forEach((source) => {
       const selected = chosen.has(source.id);
-      const input = node("input", { type: "checkbox", value: source.id, checked: selected, disabled: !source.enabled && !selected });
+      const input = node("input", { type: "checkbox", value: source.id, checked: selected, disabled: state.topicSaving || (!source.enabled && !selected) });
       const label = source.archived ? `${source.name}（已移除，保留绑定）` : source.enabled ? source.name : `${source.name}（已停用）`;
       refs.topicSourceOptions.append(node("label", { className: `check-option${source.enabled ? "" : " is-disabled"}` }, [input, node("span", { text: label })]));
     });
@@ -1217,20 +1222,54 @@
   function openDialog(dialog, focusTarget = null) {
     if (!dialog || dialog.open) return;
     dialog.showModal();
-    window.setTimeout(() => (focusTarget || dialog.querySelector("input, button, select, textarea"))?.focus(), 30);
+    (focusTarget || dialog.querySelector("input:not([type=hidden]), button, select, textarea:not([hidden])"))?.focus();
   }
 
-  function closeDialog(dialog) {
+  function closeDialog(dialog, force = false) {
+    if (dialog === refs.topicDialog && !force) {
+      if (state.topicSaving) return;
+      if (topicDraftChanged() && !window.confirm("当前主题有未保存修改，确认放弃这些修改？")) return;
+    }
+    if (dialog === refs.topicDialog) state.topicDialogVersion += 1;
     if (dialog?.open) dialog.close();
   }
 
+  function topicDraftSnapshot() {
+    return JSON.stringify({
+      fields: [...refs.topicForm.querySelectorAll("input, select")].map((input) => [input.id, input.value, input.checked]),
+      keywords: keywordEditor.snapshot(), excludes: excludeEditor.snapshot()
+    });
+  }
+
+  function topicDraftChanged() {
+    return refs.topicDialog.open && state.topicDraftBaseline !== topicDraftSnapshot();
+  }
+
+  function updateTopicDraftStatus() {
+    refs.topicDraftStatus.textContent = topicDraftChanged()
+      ? "有未保存修改；保存只影响当前主题。"
+      : "尚未修改；保存只影响当前主题。";
+  }
+
+  function topicSaveError(message) {
+    refs.topicSaveError.textContent = message;
+    refs.topicSaveError.hidden = !message;
+    if (message) refs.topicSaveError.focus();
+  }
+
   function openTopicDialog(topic = null) {
+    if (state.topicSaving) return;
+    if (refs.topicDialog.open) {
+      closeDialog(refs.topicDialog);
+      if (refs.topicDialog.open) return;
+    }
+    state.topicDialogVersion += 1;
     refs.topicForm.reset();
     refs.topicId.value = topic?.id || "";
     refs.topicDialogTitle.textContent = topic ? "编辑主题" : "新建主题";
     refs.topicName.value = topic?.name || "";
-    refs.topicKeywords.value = topic?.keywords?.join(", ") || "";
-    refs.topicExcludes.value = (topic?.exclusion_keywords || topic?.exclude_keywords || []).join(", ");
+    keywordEditor.setValues(topic?.keywords || []);
+    excludeEditor.setValues(topic?.exclusion_keywords || topic?.exclude_keywords || []);
     refs.topicThreshold.value = topic?.threshold ?? state.settings.default_threshold ?? 60;
     refs.topicLimit.value = topic?.article_limit ?? state.settings.default_article_limit ?? 20;
     refs.topicThresholdDefault.checked = topic ? topic.threshold === null : true;
@@ -1240,35 +1279,41 @@
     renderTopicSourceOptions(topic?.source_ids || []);
     state.topicSuggestion = null;
     refs.topicSuggestion.hidden = true;
-    renderKeywordDrafts();
+    topicSaveError("");
+    const submit = refs.topicForm.querySelector('[type="submit"]');
+    submit._taskSequence = (submit._taskSequence || 0) + 1;
+    submit.disabled = false;
+    setButtonState(submit, null, "保存当前主题");
+    state.topicDraftBaseline = topicDraftSnapshot();
     openDialog(refs.topicDialog, refs.topicName);
+    updateTopicDraftStatus();
   }
 
   async function submitTopic(event) {
     event.preventDefault();
+    if (state.topicSaving) return;
+    topicSaveError("");
+    if (!keywordEditor.commitAll() || !excludeEditor.commitAll()) return;
     if (!refs.topicForm.reportValidity()) return;
     const id = refs.topicId.value;
     const name = refs.topicName.value.trim();
     if (!name) {
-      notify("请填写主题名称", "error");
+      topicSaveError("请填写主题名称");
       refs.topicName.focus();
       return;
     }
-    const keywords = splitKeywords(refs.topicKeywords.value);
+    const keywords = [...keywordEditor.values];
     if (!keywords.length) {
-      notify("请至少填写一个包含关键词", "error");
-      refs.topicKeywords.focus();
+      keywordEditor.feedback("请至少填写一个包含关键词", "error");
       return;
     }
     if (keywords.length > 40) {
-      notify("每个主题最多 40 个包含关键词", "error");
-      refs.topicKeywords.focus();
+      keywordEditor.feedback("每个主题最多 40 个包含关键词", "error");
       return;
     }
-    const exclusionKeywords = splitKeywords(refs.topicExcludes.value);
+    const exclusionKeywords = [...excludeEditor.values];
     if (exclusionKeywords.length > 40) {
-      notify("每个主题最多 40 个排除词", "error");
-      refs.topicExcludes.focus();
+      excludeEditor.feedback("每个主题最多 40 个排除词", "error");
       return;
     }
     const payload = {
@@ -1281,18 +1326,39 @@
       enabled: refs.topicEnabled.checked
     };
     const previousTopic = state.topics.find((topic) => topic.id === id);
+    // Avoid re-normalizing untouched legacy terms, e.g. stored compatibility punctuation.
+    if (previousTopic && JSON.stringify(keywords) === JSON.stringify(previousTopic.keywords)) delete payload.keywords;
+    if (previousTopic && JSON.stringify(exclusionKeywords) === JSON.stringify(previousTopic.exclusion_keywords || previousTopic.exclude_keywords || [])) delete payload.exclusion_keywords;
     if (previousTopic?.source_ids?.length && !payload.source_ids.length &&
         !window.confirm("清空来源会改为使用全部启用来源，而不是停止抓取。确认扩大到全部启用来源？如需暂停，请取消并关闭“启用主题”。")) return;
     const submit = refs.topicForm.querySelector('[type="submit"]');
+    state.topicSaving = true;
+    refs.topicForm.setAttribute("aria-busy", "true");
+    const controls = [...refs.topicForm.querySelectorAll("input, textarea, select, button")];
+    const disabledBeforeSave = controls.map((control) => control.disabled);
+    controls.forEach((control) => { control.disabled = true; });
+    keywordEditor.feedback("正在保存当前主题…", "loading");
+    excludeEditor.feedback("正在保存当前主题…", "loading");
     try {
       const legacyPayload = { ...payload };
       delete legacyPayload.exclusion_keywords;
       await runButtonTask(submit, () => apiWithLegacyBody(id ? `/api/topics/${encodeURIComponent(id)}` : "/api/topics", { method: id ? "PUT" : "POST", body: payload }, legacyPayload), {
         loading: "保存中", success: "已保存"
       });
-      closeDialog(refs.topicDialog);
+      state.topicDraftBaseline = topicDraftSnapshot();
+      closeDialog(refs.topicDialog, true);
       await refreshBootstrap({ quiet: true });
-    } catch (_) { /* error surfaced by runButtonTask */ }
+    } catch (error) {
+      topicSaveError(`${describeError(error)}。草稿仍保留，请修改后重试。`);
+    } finally {
+      state.topicSaving = false;
+      refs.topicForm.setAttribute("aria-busy", "false");
+      controls.forEach((control, index) => { control.disabled = disabledBeforeSave[index]; });
+      renderTopicSourceOptions();
+      keywordEditor.feedback();
+      excludeEditor.feedback();
+      updateTopicDraftStatus();
+    }
   }
 
   function splitKeywords(value) {
@@ -1305,37 +1371,28 @@
     });
   }
 
-  function renderKeywordDrafts() {
-    renderKeywordList(refs.topicKeywords, refs.topicKeywordChips, refs.topicKeywordCount);
-    renderKeywordList(refs.topicExcludes, refs.topicExcludeChips, refs.topicExcludeCount);
-  }
-
-  function renderKeywordList(input, container, counter) {
-    const values = splitKeywords(input.value);
-    counter.textContent = `${values.length} / 40`;
-    counter.dataset.state = values.length > 40 ? "error" : "ok";
-    container.replaceChildren(...values.slice(0, 40).map((value) => node("span", { className: "keyword-chip", text: value })));
-  }
-
   async function suggestTopicKeywords() {
+    if (state.topicSaving || !keywordEditor.commitAll() || !excludeEditor.commitAll()) return;
     if (!state.deepseek.configured) {
       notify("请先配置并测试 DeepSeek API Key", "error");
       openDeepSeekDialog();
       return;
     }
     const name = refs.topicName.value.trim();
-    const keywords = splitKeywords(refs.topicKeywords.value);
+    const keywords = [...keywordEditor.values];
     if (!name || !keywords.length) {
-      notify("先填写主题名称和至少一个关键词", "error");
-      (name ? refs.topicKeywords : refs.topicName).focus();
+      topicSaveError("先填写主题名称和至少一个关键词");
+      (name ? keywordEditor.entry : refs.topicName).focus();
       return;
     }
     const body = {
       name,
       keywords,
-      exclusion_keywords: splitKeywords(refs.topicExcludes.value),
+      exclusion_keywords: [...excludeEditor.values],
       goal: `扩展“${name}”的检索关键词，同时保持主题边界。`
     };
+    const dialogVersion = state.topicDialogVersion;
+    const draftSnapshot = topicDraftSnapshot();
     try {
       const payload = await runButtonTask(refs.suggestTopic, async () => {
         try {
@@ -1346,6 +1403,11 @@
           return api(`/api/topics/${encodeURIComponent(topicId)}/calibrate`, { method: "POST", body: { goal: body.goal, positive_examples: [], negative_examples: [] }, timeout: 45000 });
         }
       }, { loading: "生成中", success: "建议已生成" });
+      if (!refs.topicDialog.open || dialogVersion !== state.topicDialogVersion) return;
+      if (draftSnapshot !== topicDraftSnapshot()) {
+        topicSaveError("生成期间主题内容已修改，请重新生成建议，避免混入旧主题词。");
+        return;
+      }
       const proposal = payload?.suggestion || payload?.proposal || payload?.calibration?.proposal || payload || {};
       const suggested = splitKeywords(Array.isArray(proposal.keywords) ? proposal.keywords.join(",") : String(proposal.keywords || ""));
       const newKeywords = suggested.filter((value) => !keywords.some((current) => current.toLocaleLowerCase() === value.toLocaleLowerCase()));
@@ -1358,21 +1420,27 @@
         notify("当前主题已有 40 个关键词，请先删除一些再应用建议", "info");
         return;
       }
-      state.topicSuggestion = { keywords: newKeywords.slice(0, availableSlots), rationale: proposal.rationale || proposal.reason || "" };
+      state.topicSuggestion = { keywords: newKeywords.slice(0, availableSlots), rationale: proposal.rationale || proposal.reason || "", draftSnapshot };
       refs.topicSuggestionCopy.textContent = state.topicSuggestion.rationale || "以下关键词尚未加入主题，请确认。";
       refs.topicSuggestionChips.replaceChildren(...state.topicSuggestion.keywords.map((value) => node("span", { className: "keyword-chip", text: value })));
       refs.topicSuggestion.hidden = false;
-    } catch (_) { /* runButtonTask or api already surfaced when applicable */ }
+    } catch (error) {
+      if (refs.topicDialog.open && dialogVersion === state.topicDialogVersion) topicSaveError(describeError(error));
+    }
   }
 
   function applyTopicSuggestion() {
     if (!state.topicSuggestion?.keywords?.length) return;
-    const combined = [...splitKeywords(refs.topicKeywords.value), ...state.topicSuggestion.keywords].slice(0, 40);
-    refs.topicKeywords.value = combined.join(", ");
+    if (state.topicSuggestion.draftSnapshot !== topicDraftSnapshot()) {
+      state.topicSuggestion = null;
+      refs.topicSuggestion.hidden = true;
+      topicSaveError("主题草稿已修改，旧关键词建议不再适用；请重新生成建议。");
+      return;
+    }
+    if (!keywordEditor.merge(state.topicSuggestion.keywords)) return;
     state.topicSuggestion = null;
     refs.topicSuggestion.hidden = true;
-    renderKeywordDrafts();
-    notify("关键词建议已加入草稿；保存主题后才会生效", "success");
+    updateTopicDraftStatus();
   }
 
   function syncTopicDefaultControls() {
@@ -2263,8 +2331,16 @@
     }));
 
     refs.topicForm.addEventListener("submit", submitTopic);
-    refs.topicKeywords.addEventListener("input", renderKeywordDrafts);
-    refs.topicExcludes.addEventListener("input", renderKeywordDrafts);
+    refs.topicForm.addEventListener("input", updateTopicDraftStatus);
+    refs.topicForm.addEventListener("change", updateTopicDraftStatus);
+    refs.topicForm.addEventListener("keyword-change", updateTopicDraftStatus);
+    refs.topicDialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      if (!keywordEditor.composing && !excludeEditor.composing) closeDialog(refs.topicDialog);
+    });
+    window.addEventListener("beforeunload", (event) => {
+      if (topicDraftChanged()) { event.preventDefault(); event.returnValue = ""; }
+    });
     refs.suggestTopic.addEventListener("click", suggestTopicKeywords);
     refs.applyTopicSuggestion.addEventListener("click", applyTopicSuggestion);
     refs.topicThresholdDefault.addEventListener("change", syncTopicDefaultControls);
@@ -2370,6 +2446,8 @@
 
   async function init() {
     cacheRefs();
+    keywordEditor = new window.CockpitKeywordEditor({ prefix: "topic-keyword", canonicalId: "topic-keywords", label: "关键词" });
+    excludeEditor = new window.CockpitKeywordEditor({ prefix: "topic-exclude", canonicalId: "topic-excludes", label: "排除词" });
     bindEvents();
     renderAll();
     if (!sessionToken) {

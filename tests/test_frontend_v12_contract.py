@@ -99,7 +99,9 @@ def test_smart_supplement_copy_is_bounded_and_keyword_suggestions_require_confir
     assert "零命中时使用语义兜底" not in html
     assert "不会自动修改；确认后才加入草稿" in html
     assert "确认加入草稿" in html
-    assert "关键词建议已加入草稿；保存主题后才会生效" in javascript
+    component = _read("keyword-editor.js")
+    assert "建议已加入草稿；保存当前主题后生效" in component
+    assert "keywordEditor.merge(state.topicSuggestion.keywords)" in javascript
     assert 'refs.applyTopicSuggestion.addEventListener("click", applyTopicSuggestion)' in javascript
 
 
