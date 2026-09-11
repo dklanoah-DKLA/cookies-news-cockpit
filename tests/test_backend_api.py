@@ -65,7 +65,10 @@ def test_api_requires_session_token_and_bootstrap_contract(backend_home: Path) -
         "deepseek",
         "topics",
         "sources",
+        "archived_sources",
+        "source_scope_warning",
         "current_run",
+        "current_source_errors",
         "latest_report",
     }
     assert payload["product"]["name"] == "Cookies News Cockpit"

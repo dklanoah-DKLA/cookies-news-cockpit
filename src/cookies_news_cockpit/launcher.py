@@ -12,6 +12,7 @@ from pathlib import Path
 import uvicorn
 
 from .api import create_app
+from .instance import AlreadyRunningError, InstanceOwner, existing_session_url
 from .runtime import resolve_paths
 
 IDLE_EXIT_SECONDS = 300
@@ -57,35 +58,65 @@ async def _watch_exit(server: uvicorn.Server, state: object) -> None:
 
 async def _serve(port: int, launch_browser: bool) -> None:
     paths = resolve_paths()
-    _configure_logging(paths.logs)
-    app = create_app(paths=paths)
-    state = app.state.cockpit
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("127.0.0.1", port))
-    sock.listen(128)
-    selected_port = sock.getsockname()[1]
-    # The token stays in the URL fragment, which browsers do not send in HTTP
-    # requests or Referer headers. The frontend captures it then clears the URL.
-    url = f"http://127.0.0.1:{selected_port}/#token={state.token}"
-    config = uvicorn.Config(
-        app,
-        host="127.0.0.1",
-        port=selected_port,
-        log_level="warning",
-        access_log=False,
-    )
-    server = uvicorn.Server(config)
-    watchers = [asyncio.create_task(_watch_exit(server, state), name="idle-exit")]
-    if launch_browser:
-        watchers.append(asyncio.create_task(_open_browser(url), name="open-browser"))
     try:
+        owner = InstanceOwner(paths.root).acquire()
+    except AlreadyRunningError:
+        # The first launch may still be preparing its socket. Never initialize
+        # a database, configure shared log rotation, or run recovery here.
+        if launch_browser:
+            for _ in range(30):
+                url = existing_session_url(paths.root)
+                if url:
+                    await _open_browser(url)
+                    break
+                await asyncio.sleep(0.1)
+        return
+    sock: socket.socket | None = None
+    watchers: list[asyncio.Task[None]] = []
+    try:
+        _configure_logging(paths.logs)
+        app = create_app(paths=paths, instance_owner=owner)
+        state = app.state.cockpit
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", port))
+        sock.listen(128)
+        selected_port = sock.getsockname()[1]
+        # The fragment is never sent in HTTP requests or Referer headers.
+        url = f"http://127.0.0.1:{selected_port}/#token={state.token}"
+        config = uvicorn.Config(
+            app,
+            host="127.0.0.1",
+            port=selected_port,
+            log_level="warning",
+            access_log=False,
+        )
+        server = uvicorn.Server(config)
+
+        async def publish_ready_endpoint() -> None:
+            while not server.started and not server.should_exit:
+                await asyncio.sleep(0.05)
+            if not server.started:
+                return
+            try:
+                owner.publish_url(url)
+            except OSError:
+                logging.getLogger(__name__).warning("Could not publish private local endpoint")
+            if launch_browser:
+                await _open_browser(url)
+
+        watchers = [
+            asyncio.create_task(_watch_exit(server, state), name="idle-exit"),
+            asyncio.create_task(publish_ready_endpoint(), name="publish-endpoint"),
+        ]
         await server.serve(sockets=[sock])
     finally:
         for task in watchers:
             task.cancel()
         await asyncio.gather(*watchers, return_exceptions=True)
-        sock.close()
+        if sock is not None:
+            sock.close()
+        owner.close()
 
 
 def main() -> None:

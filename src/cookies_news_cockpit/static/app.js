@@ -21,6 +21,8 @@
 
   const ACTIVE_RUN_STATES = new Set(["queued", "running"]);
   const FINAL_RUN_STATES = new Set(["complete", "degraded", "failed", "cancelled"]);
+  // Server allows 45 s transfer + 5 s entry validation. Leave response margin.
+  const SOURCE_VALIDATION_TIMEOUT = 60000;
   const sessionToken = captureSessionToken();
 
   const state = {
@@ -39,6 +41,9 @@
     deepseek: { configured: false, model: "deepseek-v4-flash", status: "unconfigured" },
     topics: [],
     sources: [],
+    archivedSources: [],
+    sourceScopeWarning: null,
+    currentSourceErrors: [],
     sourcePresets: [],
     currentRun: null,
     latestReport: null,
@@ -88,7 +93,7 @@
       "run-badge", "run-mode", "run-analysis-mode", "run-model", "run-cap", "run-dedupe", "run-retention",
       "topic-sheet", "source-sheet", "deepseek-badge", "deepseek-action", "history-filter",
       "history-query", "history-topic", "history-favorite", "history-list", "history-load-more", "dock-status", "dock-note",
-      "start-run", "search-dialog", "command-query", "command-results", "topic-dialog", "topic-form",
+      "start-run", "source-scope-warning", "search-dialog", "command-query", "command-results", "topic-dialog", "topic-form",
       "topic-dialog-title", "topic-id", "topic-name", "topic-keywords", "topic-keyword-count", "topic-keyword-chips", "topic-excludes", "topic-exclude-count", "topic-exclude-chips",
       "topic-threshold", "topic-limit", "suggest-topic", "topic-suggestion", "topic-suggestion-copy", "topic-suggestion-chips", "apply-topic-suggestion",
       "topic-threshold-default", "topic-limit-default", "topic-source-options", "topic-enabled", "source-dialog", "source-form", "source-dialog-title",
@@ -420,22 +425,28 @@
     const reportRun = report?.run;
     if (!current || !reportRun || !FINAL_RUN_STATES.has(current.status)) return null;
     const selected = funnelNumber(current, "selected", "kept", "stored_count") ?? firstNumeric(current, "article_count") ?? 0;
-    if (selected !== 0) return null;
     const differentIds = Boolean(current.id && reportRun.id && current.id !== reportRun.id);
     const currentTime = runTimestamp(current);
     const effectiveTime = reportTimestamp(report);
     const differentTimes = Boolean(currentTime && effectiveTime && currentTime !== effectiveTime);
     if (!differentIds && !differentTimes) return null;
-    return { currentTime, effectiveTime };
+    return { currentTime, effectiveTime, selected };
   }
 
   function renderReportContext(report) {
     const context = retainedReportContext(report);
     refs.reportContext.replaceChildren();
-    refs.reportContext.hidden = !context;
+    refs.reportContext.hidden = !context && report?.run?.status !== "degraded";
+    if (!context && report?.run?.status === "degraded") {
+      refs.reportContext.append(
+        node("strong", { text: state.currentRun?.id === report.run.id ? "本次部分完成 · 已展示可用新结果" : "当前报告部分完成 · 已展示可用结果" }),
+        node("span", { text: report.run.warning || "部分来源或 AI 未成功，已保留并展示可用文章。" })
+      );
+      return;
+    }
     if (!context) return;
     refs.reportContext.append(
-      node("strong", { text: "本次新增 0 条 · 当前为上次有效报告" }),
+      node("strong", { text: context.selected === 0 ? "本次新增 0 条 · 当前为上次有效报告" : "当前为上次有效报告 · 本次结果可在历史中查看" }),
       node("span", {
         text: `本次任务：${dateLabel(context.currentTime)} · 当前报告：${dateLabel(context.effectiveTime)}`
       })
@@ -469,7 +480,10 @@
       state.sourcePresets = Array.isArray(payload.source_presets || payload.presets) ? (payload.source_presets || payload.presets) : [];
       state.topics = Array.isArray(payload.topics) ? payload.topics : [];
       state.sources = Array.isArray(payload.sources) ? payload.sources : [];
+      state.archivedSources = Array.isArray(payload.archived_sources) ? payload.archived_sources : [];
+      state.sourceScopeWarning = payload.source_scope_warning || null;
       state.currentRun = payload.current_run || null;
+      state.currentSourceErrors = Array.isArray(payload.current_source_errors) ? payload.current_source_errors : [];
       state.latestReport = payload.latest_report || null;
       if (state.activeTopicId && !state.topics.some((topic) => topic.id === state.activeTopicId)) {
         state.activeTopicId = null;
@@ -489,6 +503,7 @@
   }
 
   function renderAll() {
+    renderSourceScopeWarning();
     renderMetrics();
     renderTopicRail();
     renderLatest();
@@ -641,16 +656,29 @@
     }
   }
 
+  function renderSourceScopeWarning() {
+    const warning = state.sourceScopeWarning;
+    const topics = state.topics.filter((topic) => (warning?.topic_ids || []).includes(topic.id));
+    refs.sourceScopeWarning.replaceChildren();
+    refs.sourceScopeWarning.hidden = !topics.length;
+    if (!topics.length) return;
+    refs.sourceScopeWarning.append(
+      node("strong", { text: "请确认升级前的主题来源" }),
+      node("p", { text: warning.message || "旧版移除来源后，部分主题的范围需要重新确认。" }),
+      node("button", { type: "button", className: "button button--secondary", text: "检查来源", onclick: () => openTopicDialog(topics[0]) })
+    );
+  }
+
   function renderSourceErrors(report) {
-    const errors = Array.isArray(report?.source_errors) ? report.source_errors : [];
+    const errors = state.currentRun ? state.currentSourceErrors : (Array.isArray(report?.source_errors) ? report.source_errors : []);
     refs.sourceErrors.replaceChildren();
     refs.sourceErrors.hidden = !errors.length;
     if (!errors.length) return;
-    refs.sourceErrors.append(node("strong", { text: `${errors.length} 个来源需要检查` }));
+    refs.sourceErrors.append(node("strong", { text: `本次 ${errors.length} 个来源需要检查` }));
     const list = node("ul");
     errors.forEach((error) => {
       const item = typeof error === "string" ? { error } : error;
-      const source = state.sources.find((candidate) => candidate.id === item.source_id);
+      const source = [...state.sources, ...state.archivedSources].find((candidate) => candidate.id === item.source_id);
       list.append(node("li", { text: `${source?.name || item.source_name || "未知来源"}：${item.error || item.message || "读取失败"}` }));
     });
     refs.sourceErrors.append(list);
@@ -1126,19 +1154,22 @@
     if (!refs.topicSourceOptions) return;
     const chosen = new Set(selectedIds || checkedSourceIds() || []);
     refs.topicSourceOptions.replaceChildren();
-    if (!state.sources.length) {
+    const sources = [...state.sources, ...state.archivedSources.filter((source) => chosen.has(source.id))];
+    if (!sources.length) {
       refs.topicSourceOptions.append(node("p", { className: "helper-copy", text: "先添加新闻来源；留空时主题会使用全部启用来源。" }));
       return;
     }
-    state.sources.forEach((source) => {
-      const input = node("input", { type: "checkbox", value: source.id, checked: source.enabled && chosen.has(source.id), disabled: !source.enabled });
-      refs.topicSourceOptions.append(node("label", { className: `check-option${source.enabled ? "" : " is-disabled"}` }, [input, node("span", { text: source.enabled ? source.name : `${source.name}（已停用）` })]));
+    sources.forEach((source) => {
+      const selected = chosen.has(source.id);
+      const input = node("input", { type: "checkbox", value: source.id, checked: selected, disabled: !source.enabled && !selected });
+      const label = source.archived ? `${source.name}（已移除，保留绑定）` : source.enabled ? source.name : `${source.name}（已停用）`;
+      refs.topicSourceOptions.append(node("label", { className: `check-option${source.enabled ? "" : " is-disabled"}` }, [input, node("span", { text: label })]));
     });
   }
 
   function checkedSourceIds() {
     if (!refs.topicSourceOptions) return [];
-    return [...refs.topicSourceOptions.querySelectorAll('input[type="checkbox"]:checked:not(:disabled)')].map((input) => input.value);
+    return [...refs.topicSourceOptions.querySelectorAll('input[type="checkbox"]:checked')].map((input) => input.value);
   }
 
   function populateSettingsForm() {
@@ -1227,6 +1258,9 @@
       source_ids: checkedSourceIds(),
       enabled: refs.topicEnabled.checked
     };
+    const previousTopic = state.topics.find((topic) => topic.id === id);
+    if (previousTopic?.source_ids?.length && !payload.source_ids.length &&
+        !window.confirm("清空来源会改为使用全部启用来源，而不是停止抓取。确认扩大到全部启用来源？如需暂停，请取消并关闭“启用主题”。")) return;
     const submit = refs.topicForm.querySelector('[type="submit"]');
     try {
       const legacyPayload = { ...payload };
@@ -1405,12 +1439,13 @@
 
   async function validateSource(source, button) {
     try {
-      const result = await runButtonTask(button, () => api(`/api/sources/${encodeURIComponent(source.id)}/validate`, { method: "POST" }), { loading: "验证中", success: "正常" });
+      const result = await runButtonTask(button, () => api(`/api/sources/${encodeURIComponent(source.id)}/validate`, { method: "POST", timeout: SOURCE_VALIDATION_TIMEOUT }), { loading: "验证中", success: "正常" });
       const sample = result?.sample_title || result?.feed_title || result?.title;
       notify(sample ? `验证成功：${sample}` : `来源验证成功${Number.isFinite(Number(result?.entry_count)) ? ` · ${result.entry_count} 条` : ""}`, "success");
       await refreshBootstrap({ quiet: true });
     } catch (error) {
       if (!button) notify(describeError(error), "error");
+      await refreshBootstrap({ quiet: true }).catch(() => {});
     }
   }
 
@@ -1427,10 +1462,10 @@
     try {
       const result = await runButtonTask(refs.validateSourceDraft, async () => {
         try {
-          return await api("/api/sources/validate", { method: "POST", body: draft, timeout: 45000 });
+          return await api("/api/sources/validate", { method: "POST", body: draft, timeout: SOURCE_VALIDATION_TIMEOUT });
         } catch (error) {
           if (!id || ![404, 405].includes(Number(error.status))) throw error;
-          return api(`/api/sources/${encodeURIComponent(id)}/validate`, { method: "POST", timeout: 45000 });
+          return api(`/api/sources/${encodeURIComponent(id)}/validate`, { method: "POST", timeout: SOURCE_VALIDATION_TIMEOUT });
         }
       }, { loading: "验证中", success: "验证通过" });
       refs.sourceValidation.dataset.state = "success";
@@ -1452,7 +1487,7 @@
     try {
       await api(`/api/sources/${encodeURIComponent(source.id)}`, { method: "DELETE" });
       state.sources = state.sources.filter((item) => item.id !== source.id);
-      state.topics.forEach((topic) => { topic.source_ids = (topic.source_ids || []).filter((id) => id !== source.id); });
+      state.archivedSources.push({ ...source, archived: true, enabled: false });
       renderAll();
       notify(`已移除来源“${source.name}”`, "success", {
         label: "撤销",
@@ -1606,6 +1641,7 @@
     try {
       const payload = await api("/api/runs", { method: "POST", body });
       state.currentRun = payload.run || null;
+      state.currentSourceErrors = [];
       renderRunLane();
       manageRunPolling();
     } catch (error) {
@@ -1625,6 +1661,7 @@
       const payload = await api(`/api/runs/${encodeURIComponent(run.id)}/cancel`, { method: "POST", body: {} });
       state.currentRun = payload.run || { ...run, status: "cancelled", outcome: "cancelled", phase: "cancelled" };
       notify("任务已取消，上一份有效报告继续保留", "info");
+      await refreshBootstrap({ quiet: true });
     } catch (error) {
       notify(describeError(error), "error");
     } finally {
@@ -1645,12 +1682,11 @@
       const payload = await api("/api/runs/current", { timeout: 8000 });
       const previous = state.currentRun?.status;
       state.currentRun = payload.run || null;
+      state.currentSourceErrors = Array.isArray(payload.source_errors) ? payload.source_errors : [];
       renderRunLane();
+      renderSourceErrors(state.latestReport);
       if (FINAL_RUN_STATES.has(state.currentRun?.status)) {
-        const reportPayload = await api("/api/reports/latest");
-        state.latestReport = reportPayload.report || null;
-        renderLatest();
-        await loadHistory({ quiet: true });
+        await refreshBootstrap({ quiet: true });
         if (state.currentRun.status !== previous) {
           const duplicateOnly = state.currentRun.status === "complete"
             && Number(state.currentRun.article_count || 0) === 0
@@ -2286,13 +2322,11 @@
       const previousStatus = state.currentRun?.status;
       const currentPayload = await api("/api/runs/current", { timeout: 6000 });
       state.currentRun = currentPayload.run || null;
+      state.currentSourceErrors = Array.isArray(currentPayload.source_errors) ? currentPayload.source_errors : [];
       const changed = previousId !== state.currentRun?.id || previousStatus !== state.currentRun?.status;
       renderRunLane();
       if (changed && FINAL_RUN_STATES.has(state.currentRun?.status)) {
-        const reportPayload = await api("/api/reports/latest", { timeout: 6000 });
-        state.latestReport = reportPayload.report || null;
-        renderLatest();
-        await loadHistory({ quiet: true });
+        await refreshBootstrap({ quiet: true });
       }
       if (heartbeat.run_active || ACTIVE_RUN_STATES.has(state.currentRun?.status)) manageRunPolling();
     } catch (_) { /* connection state handled by api */ }

@@ -19,7 +19,7 @@ from bs4 import BeautifulSoup
 from .models import AIAnalysis, CalibrationProposal, FeedArticle
 
 USER_AGENT = (
-    "CookiesNewsCockpit/1.2 "
+    "CookiesNewsCockpit/1.3 "
     "(+https://github.com/dklanoah-DKLA/cookies-news-cockpit; local personal reader)"
 )
 FEED_MAX_BYTES = 5 * 1024 * 1024

@@ -526,6 +526,9 @@ class RunManager:
             if not sources:
                 raise ValueError("没有可用于所选主题的已启用新闻源")
             funnel = _new_funnel(topics, sources)
+            # Keep errors on the current run too: the visible report may be an
+            # older usable result and must not be used to explain this attempt.
+            funnel["source_errors"] = source_errors
             self.db.update_run(run_id, phase="fetching", funnel=funnel)
 
             fetched: dict[str, list[FeedArticle]] = {}
@@ -1580,50 +1583,102 @@ class RunManager:
                 temporary_path.unlink()
         return destination
 
+    def source_errors(self, run: dict[str, Any] | None) -> list[dict[str, str]]:
+        if not run:
+            return []
+        funnel = run.get("funnel")
+        funnel = funnel if isinstance(funnel, dict) else {}
+        snapshots = funnel.get("per_source")
+        snapshots = snapshots if isinstance(snapshots, dict) else {}
+        errors = funnel.get("source_errors")
+        if errors is None:
+            try:
+                path = _artifact_path_for_run(self.paths.runs, str(run["id"]))
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                errors = payload.get("source_errors", []) if isinstance(payload, dict) else []
+                artifact_run = payload.get("run") if isinstance(payload, dict) else None
+                artifact_funnel = (
+                    artifact_run.get("funnel") if isinstance(artifact_run, dict) else None
+                )
+                artifact_sources = (
+                    artifact_funnel.get("per_source")
+                    if isinstance(artifact_funnel, dict) else None
+                )
+                if not snapshots and isinstance(artifact_sources, dict):
+                    snapshots = artifact_sources
+            except (OSError, ValueError, KeyError):
+                errors = []
+        if not isinstance(errors, list):
+            return []
+        result = []
+        for item in errors:
+            if not isinstance(item, dict) or not item.get("error"):
+                continue
+            source_id = str(item.get("source_id", ""))
+            error = {"source_id": source_id, "error": str(item["error"])[:500]}
+            snapshot = snapshots.get(source_id)
+            name = snapshot.get("name") if isinstance(snapshot, dict) else None
+            if isinstance(name, str) and name.strip():
+                # Imports can remap source IDs, while frozen statistics retain
+                # the original IDs and labels. Keep the historical identity
+                # understandable without rewriting those stored snapshots.
+                error["source_name"] = name.strip()[:200]
+            result.append(error)
+        return result
+
     def latest_report(self) -> dict[str, Any] | None:
-        run_id = self.db.get_latest_good_run_id()
-        fallback = False
+        checkpoint = self.db.get_latest_good_run_id()
+        candidates = self.db.list_usable_run_ids()
+        run_id: str | None = None
+        committed: dict[str, Any] | None = None
+        for candidate_id in candidates:
+            # A process may stop after finalizing its DB rows but before the
+            # atomic report-file write. Skip that candidate rather than hiding
+            # an earlier committed degraded report behind the old checkpoint.
+            try:
+                artifact = _artifact_path_for_run(self.paths.runs, candidate_id)
+                payload = json.loads(artifact.read_text(encoding="utf-8"))
+                if (
+                    isinstance(payload, dict)
+                    and isinstance(payload.get("run"), dict)
+                    and payload["run"].get("id") == candidate_id
+                    and payload["run"].get("status") in ("complete", "degraded")
+                    and isinstance(payload.get("articles"), list)
+                    and isinstance(payload.get("source_errors"), list)
+                ):
+                    run_id, committed = candidate_id, payload
+                    break
+            except (OSError, ValueError):
+                pass
+            if candidate_id == checkpoint:
+                # A confirmed complete checkpoint can still be reconstructed
+                # from its DB rows if its old report file was lost or damaged.
+                run_id = checkpoint
+                break
         if not run_id:
-            run_id = self.db.get_newest_usable_run_id()
-            fallback = bool(run_id)
+            run_id = checkpoint or (candidates[0] if candidates else None)
         if not run_id:
             return None
 
-        def report_run() -> dict[str, Any]:
-            run = self.db.get_run(run_id)
-            if fallback:
-                run = dict(run)
-                run["status"] = "degraded"
-                notice = "当前显示首次可用的降级结果；尚无完整报告。"
-                run["warning"] = " ".join(filter(None, [run.get("warning"), notice]))
-            return run
+        run = self.db.get_run(run_id)
+        if run["status"] == "degraded":
+            notice = "当前展示部分完成的可用新结果；失败来源或 AI 降级情况见对应任务。"
+            run["warning"] = " ".join(filter(None, [run.get("warning"), notice]))
+        if not checkpoint and (committed is None or run["status"] == "degraded"):
+            # Preserve database-only legacy/import recovery for the first
+            # usable result without describing it as a confirmed full report.
+            run["status"] = "degraded"
+            notice = "当前显示首次可用的降级结果；尚无完整报告。"
+            run["warning"] = " ".join(filter(None, [run.get("warning"), notice]))
 
-        try:
-            path = _artifact_path_for_run(self.paths.runs, run_id)
-        except ValueError:
-            # A legacy or manually corrupted database must never turn report
-            # lookup into an arbitrary filesystem read.
-            LOGGER.error("Refusing unsafe run artifact id %r", run_id)
-            path = None
-        if path is not None and path.exists():
-            try:
-                report = json.loads(path.read_text(encoding="utf-8"))
-                # Favorites are mutable user metadata. Overlay current rows on
-                # the immutable raw run artifact without rewriting that file.
-                report["run"] = report_run()
-                report["articles"] = [
-                    {key: value for key, value in article.items() if key != "full_text"}
-                    for article in self.db.list_run_articles(run_id)
-                ]
-                return report
-            except (OSError, json.JSONDecodeError):
-                pass
+        # Favorites are mutable user metadata. Rebuild the public report from
+        # current rows without rewriting its immutable commitment artifact.
         return {
             "schema_version": (
                 self.db.get_schema_version() if hasattr(self.db, "get_schema_version") else 2
             ),
-            "run": report_run(),
-            "source_errors": [],
+            "run": run,
+            "source_errors": self.source_errors(run),
             "articles": [
                 {key: value for key, value in article.items() if key != "full_text"}
                 for article in self.db.list_run_articles(run_id)

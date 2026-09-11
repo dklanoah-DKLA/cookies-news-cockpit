@@ -19,8 +19,8 @@ from .models import Settings, SettingsUpdate, SourceInput, SourcePatch, TopicInp
 from .presets import PRESET_CATALOG_VERSION, SOURCE_PRESETS
 
 SCHEMA_VERSION = 2
-UPGRADE_CHECKPOINT = "upgrade_checkpoint_1_2_0"
-UPGRADE_SNAPSHOT_NAME = "before-upgrade-1.2.0.sqlite3"
+UPGRADE_CHECKPOINT = "upgrade_checkpoint_1_3_0"
+UPGRADE_SNAPSHOT_NAME = "before-upgrade-1.3.0.sqlite3"
 UPGRADE_LOCK_NAME = ".upgrade-1.2.0.lock.sqlite3"
 PORTABLE_SETTINGS_FIELDS = (
     "default_threshold",
@@ -563,6 +563,41 @@ def _validated_import_records(
     return source_records, topic_records, run_records, article_records
 
 
+def _match_import_source(
+    record: dict[str, Any], local_sources: Sequence[sqlite3.Row | dict[str, Any]]
+) -> sqlite3.Row | dict[str, Any] | None:
+    """Use stable identity when a local source URL was edited, in both phases."""
+
+    sources = {source["id"]: source for source in local_sources}
+    by_url = next(
+        (
+            source
+            for source in sources.values()
+            if _normalized_source_url(source["url"]) == record["url"]
+        ),
+        None,
+    )
+    preset_id = record["value"].preset_id
+    stable_matches = (
+        [source for source in sources.values() if source["preset_id"] == preset_id]
+        if preset_id
+        else []
+    )
+    if len(stable_matches) > 1:
+        raise ValueError("本机存在同一预设的多个来源，无法安全合并，请先整理来源")
+    stable = stable_matches[0] if stable_matches else None
+    if stable is None and not preset_id:
+        candidate = sources.get(record["id"])
+        if candidate is not None:
+            same_name = str(candidate["name"]).casefold() == record["value"].name.casefold()
+            if not same_name and by_url is None:
+                raise ValueError("备份来源 ID 与本机来源冲突，地址和名称均不同，无法安全合并")
+            stable = candidate
+    if by_url is not None and stable is not None and by_url["id"] != stable["id"]:
+        raise ValueError("备份来源的地址与预设或 ID 指向不同本机来源，无法安全合并")
+    return stable if stable is not None else by_url
+
+
 class NotFoundError(LookupError):
     pass
 
@@ -763,7 +798,7 @@ class Database:
         return bool(cls._table_names(db))
 
     def _ensure_upgrade_snapshot(self, db: sqlite3.Connection) -> str:
-        """Create one atomic SQLite backup before 1.2 touches an existing database."""
+        """Create one atomic SQLite backup before 1.3 touches an existing database."""
 
         backup_directory = self.path.parent / "backups"
         backup_directory.mkdir(parents=True, exist_ok=True)
@@ -772,7 +807,7 @@ class Database:
             return destination.name
 
         descriptor, temporary = tempfile.mkstemp(
-            prefix=".before-upgrade-1.2.0-", suffix=".tmp", dir=backup_directory
+            prefix=".before-upgrade-1.3.0-", suffix=".tmp", dir=backup_directory
         )
         os.close(descriptor)
         temporary_path = Path(temporary)
@@ -811,7 +846,7 @@ class Database:
     @staticmethod
     def _record_upgrade_checkpoint(db: sqlite3.Connection, snapshot_name: str | None) -> None:
         payload = {
-            "version": "1.2.0",
+            "version": "1.3.0",
             "created_at": utc_now(),
             "snapshot": snapshot_name,
         }
@@ -920,6 +955,7 @@ class Database:
 
         if previous_version < SCHEMA_VERSION:
             cls._classify_legacy_sources(db)
+        cls._repair_archived_source_scopes(db)
         cls._sync_source_presets(db, now, enable_defaults=not existing_install)
         db.execute(
             """INSERT INTO metadata(key, value) VALUES('schema_version', ?)
@@ -927,6 +963,114 @@ class Database:
             (str(SCHEMA_VERSION),),
         )
         db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    @staticmethod
+    def _repair_archived_source_scopes(db: sqlite3.Connection) -> None:
+        """Recover 1.2's pruned bindings without introducing an active source.
+
+        Old deletion snapshots are the only evidence of explicit source scope.
+        A later edit can make them ambiguous: an empty scope would silently mean
+        every active source, so retain its unavailable binding and request review.
+        A later nonempty edit already has a bounded scope and remains untouched.
+        """
+
+        db.execute("UPDATE sources SET user_modified = 1 WHERE archived = 1")
+        snapshots = db.execute(
+            """SELECT snapshots.* FROM source_archive_snapshots AS snapshots
+            JOIN sources ON sources.id = snapshots.source_id WHERE sources.archived = 1
+            ORDER BY snapshots.deleted_at, snapshots.source_id"""
+        ).fetchall()
+        warning_row = db.execute(
+            "SELECT value FROM metadata WHERE key = 'source_scope_migration_warning'"
+        ).fetchone()
+        warning = _loads(warning_row["value"] if warning_row else None, {})
+        recovered = set(warning.get("recovered_topic_ids", []))
+        unresolved = set(warning.get("unresolved_topic_ids", []))
+        # Read original scopes once; repairing one of several removed sources
+        # must not change how the next snapshot is classified.
+        topics = {row["id"]: row for row in db.execute("SELECT * FROM topics")}
+        for snapshot in snapshots:
+            for topic_id in _loads(snapshot["topic_ids_json"], []):
+                topic = topics.get(topic_id)
+                if topic is None:
+                    continue
+                original_ids = _loads(topic["source_ids_json"], [])
+                source_id = snapshot["source_id"]
+                if source_id in original_ids:
+                    continue
+                unchanged = topic["updated_at"] == snapshot["deleted_at"]
+                if unchanged or not original_ids:
+                    row = db.execute(
+                        "SELECT source_ids_json FROM topics WHERE id = ?", (topic_id,)
+                    ).fetchone()
+                    restored_ids = _loads(row["source_ids_json"], [])
+                    if source_id not in restored_ids:
+                        restored_ids.append(source_id)
+                    db.execute(
+                        "UPDATE topics SET source_ids_json = ? WHERE id = ?",
+                        (json.dumps(restored_ids), topic_id),
+                    )
+                    if not unchanged:
+                        recovered.add(topic_id)
+                else:
+                    unresolved.add(topic_id)
+        # From 1.3 onward IDs remain in the topic itself. Replaying an old
+        # snapshot at restore time could undo a user's later explicit choice.
+        db.execute("DELETE FROM source_archive_snapshots")
+        if recovered or unresolved:
+            warning = {
+                "message": (
+                    "旧版移除来源后的主题范围存在歧义：空范围已恢复为原来源的不可用绑定，"
+                    "已有明确范围保持不变。请检查所列主题的来源选择并保存确认。"
+                ),
+                "topic_ids": sorted(recovered | unresolved),
+                "recovered_topic_ids": sorted(recovered),
+                "unresolved_topic_ids": sorted(unresolved),
+            }
+            db.execute(
+                """INSERT INTO metadata(key, value) VALUES('source_scope_migration_warning', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                (json.dumps(warning, ensure_ascii=False),),
+            )
+
+    def source_scope_warning(self) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT value FROM metadata WHERE key = 'source_scope_migration_warning'"
+            ).fetchone()
+        return _loads(row["value"], None) if row else None
+
+    @staticmethod
+    def _confirm_topic_source_scope(db: sqlite3.Connection, topic_id: str) -> None:
+        row = db.execute(
+            "SELECT value FROM metadata WHERE key = 'source_scope_migration_warning'"
+        ).fetchone()
+        if row is None:
+            return
+        warning = _loads(row["value"], {})
+        for key in ("topic_ids", "recovered_topic_ids", "unresolved_topic_ids"):
+            warning[key] = [item for item in warning.get(key, []) if item != topic_id]
+        if warning["topic_ids"]:
+            db.execute(
+                "UPDATE metadata SET value = ? WHERE key = 'source_scope_migration_warning'",
+                (json.dumps(warning, ensure_ascii=False),),
+            )
+        else:
+            db.execute("DELETE FROM metadata WHERE key = 'source_scope_migration_warning'")
+
+    @staticmethod
+    def _validate_topic_sources(
+        db: sqlite3.Connection, source_ids: Sequence[str], *, existing_ids: Sequence[str] = ()
+    ) -> None:
+        existing = set(existing_ids)
+        for source_id in source_ids:
+            source = db.execute(
+                "SELECT archived FROM sources WHERE id = ?", (source_id,)
+            ).fetchone()
+            if source is None:
+                raise ValueError("主题引用的新闻源不存在，请重新选择来源")
+            if bool(source["archived"]) and source_id not in existing:
+                raise ValueError("不能新增已移除的新闻源绑定，请先恢复该来源")
 
     @staticmethod
     def _classify_legacy_sources(db: sqlite3.Connection) -> None:
@@ -989,7 +1133,15 @@ class Database:
     @staticmethod
     def _sync_source_presets(db: sqlite3.Connection, now: str, *, enable_defaults: bool) -> None:
         for preset in SOURCE_PRESETS:
-            row = db.execute("SELECT * FROM sources WHERE url = ?", (preset.url,)).fetchone()
+            # A source retains its preset identity after its URL is edited.
+            # Looking up URL alone recreates the old preset at the next launch.
+            row = db.execute(
+                """SELECT * FROM sources WHERE preset_id = ? OR id = ?
+                ORDER BY user_modified DESC, (id = ?) DESC, created_at LIMIT 1""",
+                (preset.id, preset.id, preset.id),
+            ).fetchone()
+            if row is None:
+                row = db.execute("SELECT * FROM sources WHERE url = ?", (preset.url,)).fetchone()
             if row is not None:
                 if not bool(row["user_modified"]):
                     db.execute(
@@ -1107,6 +1259,7 @@ class Database:
         now = utc_now()
         topic_id = uuid.uuid4().hex
         with self.connect() as db:
+            self._validate_topic_sources(db, value.source_ids)
             count = db.execute("SELECT COUNT(*) FROM topics WHERE archived = 0").fetchone()[0]
             if count >= 10:
                 raise TopicLimitError("最多只能创建 10 个主题")
@@ -1159,6 +1312,9 @@ class Database:
         # threshold=null from fields the client simply did not send.
         values = current | patch.model_dump(exclude_unset=True)
         with self.connect() as db:
+            self._validate_topic_sources(
+                db, values["source_ids"], existing_ids=current["source_ids"]
+            )
             db.execute(
                 """UPDATE topics SET name = ?, keywords_json = ?, exclusion_keywords_json = ?,
                 threshold = ?, article_limit = ?, source_ids_json = ?, enabled = ?, updated_at = ?
@@ -1175,6 +1331,8 @@ class Database:
                     topic_id,
                 ),
             )
+            if "source_ids" in patch.model_fields_set:
+                self._confirm_topic_source_scope(db, topic_id)
         return self.get_topic(topic_id)
 
     def delete_topic(self, topic_id: str) -> None:
@@ -1270,7 +1428,6 @@ class Database:
                         source_id,
                     ),
                 )
-                self._restore_source_relations(db, source_id)
             else:
                 db.execute(
                     """INSERT INTO sources
@@ -1335,66 +1492,27 @@ class Database:
             ).fetchone()
             if source is None:
                 raise NotFoundError("新闻源不存在")
-            rows = db.execute("SELECT id, source_ids_json FROM topics").fetchall()
-            linked_topic_ids = [
-                row["id"] for row in rows if source_id in _loads(row["source_ids_json"], [])
-            ]
-            db.execute(
-                """INSERT INTO source_archive_snapshots(source_id, topic_ids_json, deleted_at)
-                VALUES (?, ?, ?) ON CONFLICT(source_id) DO UPDATE SET
-                topic_ids_json = excluded.topic_ids_json, deleted_at = excluded.deleted_at""",
-                (source_id, json.dumps(linked_topic_ids), utc_now()),
-            )
             result = db.execute(
-                "UPDATE sources SET archived = 1, enabled = 0, updated_at = ? "
+                "UPDATE sources SET archived = 1, enabled = 0, user_modified = 1, updated_at = ? "
                 "WHERE id = ? AND archived = 0",
                 (utc_now(), source_id),
             )
-            # Remove stale selections from topics without relying on JSON1.
-            for row in rows:
-                ids = [item for item in _loads(row["source_ids_json"], []) if item != source_id]
-                db.execute(
-                    "UPDATE topics SET source_ids_json = ?, updated_at = ? WHERE id = ?",
-                    (json.dumps(ids), utc_now(), row["id"]),
-                )
+            # Keep unavailable IDs as scope tombstones. [] explicitly means all
+            # active sources, so pruning the last binding would broaden scope.
         if result.rowcount == 0:
             raise NotFoundError("新闻源不存在")
 
-    @staticmethod
-    def _restore_source_relations(db: sqlite3.Connection, source_id: str) -> None:
-        snapshot = db.execute(
-            "SELECT topic_ids_json FROM source_archive_snapshots WHERE source_id = ?", (source_id,)
-        ).fetchone()
-        if snapshot is None:
-            return
-        topic_ids = set(_loads(snapshot["topic_ids_json"], []))
-        if topic_ids:
-            rows = db.execute("SELECT id, source_ids_json FROM topics").fetchall()
-            now = utc_now()
-            for row in rows:
-                if row["id"] not in topic_ids:
-                    continue
-                source_ids = _loads(row["source_ids_json"], [])
-                if source_id not in source_ids:
-                    source_ids.append(source_id)
-                    db.execute(
-                        "UPDATE topics SET source_ids_json = ?, updated_at = ? WHERE id = ?",
-                        (json.dumps(source_ids), now, row["id"]),
-                    )
-        db.execute("DELETE FROM source_archive_snapshots WHERE source_id = ?", (source_id,))
-
     def restore_source(self, source_id: str) -> dict[str, Any]:
-        """Undo a soft archive and restore the topic bindings captured at deletion time."""
+        """Undo a soft archive; retained topic bindings become usable again."""
 
         with self.connect() as db:
             result = db.execute(
-                "UPDATE sources SET archived = 0, enabled = 1, updated_at = ? "
+                "UPDATE sources SET archived = 0, enabled = 1, user_modified = 1, updated_at = ? "
                 "WHERE id = ? AND archived = 1",
                 (utc_now(), source_id),
             )
             if result.rowcount == 0:
                 raise NotFoundError("已归档新闻源不存在")
-            self._restore_source_relations(db, source_id)
         return self.get_source(source_id)
 
     def set_source_health(self, source_id: str, ok: bool, error: str | None = None) -> None:
@@ -1499,7 +1617,14 @@ class Database:
 
     def get_current_run(self) -> dict[str, Any] | None:
         with self.connect() as db:
-            row = db.execute("SELECT * FROM runs ORDER BY started_at DESC LIMIT 1").fetchone()
+            row = db.execute(
+                """SELECT r.* FROM runs r
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM metadata m
+                    WHERE m.key = 'history_only_import:' || r.id AND m.value = 'true'
+                )
+                ORDER BY r.started_at DESC, r.rowid DESC LIMIT 1"""
+            ).fetchone()
         return self._run(row) if row else None
 
     def recover_interrupted_runs(self) -> int:
@@ -1759,7 +1884,9 @@ class Database:
         ]
 
         with self.connect() as db:
-            source_rows = db.execute("SELECT id, name, url, user_modified FROM sources").fetchall()
+            source_rows = db.execute(
+                "SELECT id, name, url, preset_id, user_modified, archived FROM sources"
+            ).fetchall()
             source_by_url: dict[str, str] = {}
             for row in source_rows:
                 normalized_url = _normalized_source_url(row["url"])
@@ -1772,9 +1899,11 @@ class Database:
             source_map: dict[str, str] = {}
             sources_new = 0
             sources_matched = 0
+            archived_sources_preserved = 0
             local_source_by_id = {row["id"]: row for row in source_rows}
             for record in source_records:
-                destination_id = source_by_url.get(record["url"])
+                matched = _match_import_source(record, list(local_source_by_id.values()))
+                destination_id = matched["id"] if matched is not None else None
                 if destination_id is None:
                     destination_id = f"new-source:{record['id']}"
                     source_by_url[record["url"]] = destination_id
@@ -1784,17 +1913,25 @@ class Database:
                     local_source_by_id[destination_id] = {
                         "id": destination_id,
                         "name": record["value"].name,
+                        "url": record["url"],
+                        "preset_id": record["value"].preset_id,
                         "user_modified": bool(
-                            record["user_modified"] or record["value"].preset_id is None
+                            record["user_modified"]
+                            or record["archived"]
+                            or record["value"].preset_id is None
                         ),
+                        "archived": record["archived"],
                     }
                     sources_new += 1
                 else:
                     sources_matched += 1
                     local = local_source_by_id.get(destination_id)
+                    if local is not None and bool(local["archived"]):
+                        archived_sources_preserved += 1
                     if (
                         local is not None
                         and not bool(local["user_modified"])
+                        and not bool(local["archived"])
                         and record["user_modified"]
                     ):
                         old_key = str(local["name"]).casefold()
@@ -1805,7 +1942,10 @@ class Database:
                         local_source_by_id[destination_id] = {
                             "id": destination_id,
                             "name": record["value"].name,
+                            "url": record["url"],
+                            "preset_id": local["preset_id"],
                             "user_modified": True,
+                            "archived": record["archived"],
                         }
                 source_map[record["id"]] = destination_id
 
@@ -1922,6 +2062,11 @@ class Database:
         topic_limit_conflict = projected_active > 10
         if topic_limit_conflict:
             warnings.append("导入后活动主题将超过 10 个，应用前需要归档部分主题。")
+        if archived_sources_preserved:
+            warnings.append(
+                f"本机已移除的 {archived_sources_preserved} 个来源保持移除；"
+                "导入不会恢复或启用它们，相关主题可能需要重新选择来源。"
+            )
         source_summary = {
             "incoming": len(source_records),
             "new": sources_new,
@@ -2007,6 +2152,7 @@ class Database:
         result: dict[str, Any] = {
             "sources_added": 0,
             "sources_matched": 0,
+            "archived_sources_preserved": 0,
             "topics_added": 0,
             "topics_matched": 0,
             "runs_added": 0,
@@ -2020,6 +2166,7 @@ class Database:
             "portable_settings_requested": bool(import_portable_settings),
             "portable_settings_applied": False,
             "portable_settings_changed": [],
+            "preserved_local_report": False,
         }
         source_map: dict[str, str] = {}
         topic_map: dict[str, str] = {}
@@ -2029,6 +2176,20 @@ class Database:
         now = utc_now()
 
         with self.connect() as db:
+            # Safe merge adds history without replacing an already usable
+            # local report, including a degraded first report with no complete
+            # checkpoint. Keep this local display policy outside frozen runs
+            # and exported data so a fresh computer can show the same backup.
+            preserve_local_report = db.execute(
+                """SELECT 1 FROM runs r
+                WHERE r.status IN ('complete', 'degraded')
+                  AND EXISTS (SELECT 1 FROM articles a WHERE a.run_id = r.id)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM metadata m
+                    WHERE m.key = 'history_only_import:' || r.id AND m.value = 'true'
+                  ) LIMIT 1"""
+            ).fetchone() is not None
+            result["preserved_local_report"] = preserve_local_report
             if import_portable_settings and portable_settings:
                 row = db.execute("SELECT payload FROM settings WHERE id = 1").fetchone()
                 current_settings = Settings.model_validate_json(
@@ -2050,7 +2211,9 @@ class Database:
 
             source_by_url: dict[str, sqlite3.Row | dict[str, Any]] = {}
             source_names: dict[str, set[str]] = {}
-            for row in db.execute("SELECT id, name, url, user_modified FROM sources"):
+            for row in db.execute(
+                "SELECT id, name, url, preset_id, user_modified, archived FROM sources"
+            ):
                 normalized_url = _normalized_source_url(row["url"])
                 if normalized_url in source_by_url:
                     raise ValueError(f"本机存在规范化后重复的新闻源地址：{normalized_url}")
@@ -2058,32 +2221,39 @@ class Database:
                 source_names.setdefault(str(row["name"]).casefold(), set()).add(row["id"])
             for record in source_records:
                 value: SourceInput = record["value"]
-                existing = source_by_url.get(record["url"])
+                existing = _match_import_source(record, list(source_by_url.values()))
                 if existing:
                     source_id = existing["id"]
-                    if not bool(existing["user_modified"]):
+                    if bool(existing["archived"]):
+                        result["archived_sources_preserved"] += 1
+                    if not bool(existing["user_modified"]) and not bool(existing["archived"]):
                         if record["user_modified"]:
                             old_name_key = str(existing["name"]).casefold()
                             db.execute(
-                                """UPDATE sources SET name = ?, homepage = ?, category = ?,
+                                """UPDATE sources SET name = ?, url = ?, homepage = ?, category = ?,
                                 language = ?, terms = ?, enabled = ?, archived = ?,
                                 user_modified = 1, updated_at = ? WHERE id = ?""",
                                 (
                                     value.name,
+                                    record["url"],
                                     str(value.homepage) if value.homepage else None,
                                     value.category,
                                     value.language,
                                     str(value.terms) if value.terms else None,
-                                    int(value.enabled),
+                                    int(value.enabled and not record["archived"]),
                                     int(record["archived"]),
                                     now,
                                     source_id,
                                 ),
                             )
+                            source_by_url.pop(_normalized_source_url(existing["url"]), None)
                             source_by_url[record["url"]] = {
                                 "id": source_id,
                                 "name": value.name,
+                                "url": record["url"],
+                                "preset_id": existing["preset_id"],
                                 "user_modified": True,
+                                "archived": record["archived"],
                             }
                             source_names.get(old_name_key, set()).discard(source_id)
                             source_names.setdefault(value.name.casefold(), set()).add(source_id)
@@ -2092,7 +2262,7 @@ class Database:
                                 """UPDATE sources SET enabled = ?, archived = ?, updated_at = ?
                                 WHERE id = ?""",
                                 (
-                                    int(value.enabled),
+                                    int(value.enabled and not record["archived"]),
                                     int(record["archived"]),
                                     now,
                                     source_id,
@@ -2102,7 +2272,7 @@ class Database:
                 else:
                     source_id = uuid.uuid4().hex
                     inserted_user_modified = bool(
-                        record["user_modified"] or value.preset_id is None
+                        record["user_modified"] or record["archived"] or value.preset_id is None
                     )
                     db.execute(
                         """INSERT INTO sources
@@ -2120,7 +2290,7 @@ class Database:
                             value.preset_id,
                             value.preset_version,
                             int(inserted_user_modified),
-                            int(value.enabled),
+                            int(value.enabled and not record["archived"]),
                             int(record["archived"]),
                             record["created_at"] or now,
                             now,
@@ -2129,7 +2299,10 @@ class Database:
                     source_by_url[record["url"]] = {
                         "id": source_id,
                         "name": value.name,
+                        "url": record["url"],
+                        "preset_id": value.preset_id,
                         "user_modified": inserted_user_modified,
+                        "archived": record["archived"],
                     }
                     source_names.setdefault(value.name.casefold(), set()).add(source_id)
                     result["sources_added"] += 1
@@ -2226,6 +2399,11 @@ class Database:
                         )
                         result["runs_added"] += 1
                         result["runs_remapped"] += int(remapped)
+                        if preserve_local_report:
+                            db.execute(
+                                "INSERT INTO metadata(key, value) VALUES (?, 'true')",
+                                (f"history_only_import:{run_id}",),
+                            )
                 run_map[record["id"]] = run_id
                 imported_run_records[run_id] = record
 
@@ -2295,6 +2473,11 @@ class Database:
                             "finished_at": now,
                         }
                         result["runs_added"] += 1
+                        if preserve_local_report:
+                            db.execute(
+                                "INSERT INTO metadata(key, value) VALUES (?, 'true')",
+                                (f"history_only_import:{synthetic_run_id}",),
+                            )
                     run_id = synthetic_run_id
                     synthetic_topic_ids.add(topic_id)
 
@@ -2377,11 +2560,16 @@ class Database:
                 if run_id in new_article_run_ids and record["status"] in {"complete", "degraded"}
             ]
             if candidates:
+                run_positions = {
+                    row["id"]: row["position"]
+                    for row in db.execute("SELECT id, rowid AS position FROM runs")
+                }
                 latest_run_id, _ = max(
                     candidates,
                     key=lambda item: (
                         item[1].get("finished_at") or item[1].get("started_at") or "",
-                        item[0],
+                        item[1].get("started_at") or "",
+                        run_positions[item[0]],
                     ),
                 )
                 result["latest_imported_run_id"] = latest_run_id
@@ -2408,7 +2596,7 @@ class Database:
 
     def export_runs(self) -> list[dict[str, Any]]:
         with self.connect() as db:
-            rows = db.execute("SELECT * FROM runs ORDER BY started_at, id").fetchall()
+            rows = db.execute("SELECT * FROM runs ORDER BY started_at, rowid ASC").fetchall()
         return [self._run(row) for row in rows]
 
     def metadata_warning(self) -> dict[str, Any] | None:
@@ -2508,10 +2696,35 @@ class Database:
                 """SELECT r.id FROM runs r
                 WHERE r.status IN ('complete', 'degraded')
                   AND EXISTS (SELECT 1 FROM articles a WHERE a.run_id = r.id)
-                ORDER BY COALESCE(r.finished_at, r.started_at) DESC, r.started_at DESC
+                  AND NOT EXISTS (
+                    SELECT 1 FROM metadata m
+                    WHERE m.key = 'history_only_import:' || r.id AND m.value = 'true'
+                  )
+                ORDER BY COALESCE(r.finished_at, r.started_at) DESC, r.started_at DESC, r.rowid DESC
                 LIMIT 1"""
             ).fetchone()
         return row["id"] if row else None
+
+    def list_usable_run_ids(self) -> list[str]:
+        """Return candidate report IDs newest first, including same-second ties.
+
+        Report-file commitment is checked by the pipeline, not inferred from a
+        final database status: a process can stop between those two writes.
+        """
+
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT r.id FROM runs r
+                WHERE r.status IN ('complete', 'degraded')
+                  AND EXISTS (SELECT 1 FROM articles a WHERE a.run_id = r.id)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM metadata m
+                    WHERE m.key = 'history_only_import:' || r.id AND m.value = 'true'
+                  )
+                ORDER BY COALESCE(r.finished_at, r.started_at) DESC,
+                         r.started_at DESC, r.rowid DESC"""
+            ).fetchall()
+        return [row["id"] for row in rows]
 
     @staticmethod
     def _ai_cache_identity(

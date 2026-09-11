@@ -74,11 +74,57 @@ async function waitForServer(url, child) {
   throw new Error("Fixture server did not become ready within 15 seconds");
 }
 
+async function stopFixtureServer(baseUrl, server) {
+  if (!server || server.exitCode !== null) return;
+  // A Windows venv launcher may be a parent of the Python service process.
+  // Request ASGI shutdown first so ownership locks and the entire tree close.
+  await new Promise((resolve) => {
+    const request = http.request(`${baseUrl}/api/e2e/shutdown`, {
+      method: "POST", headers: { "X-Cockpit-Token": sessionToken },
+    }, (response) => { response.resume(); response.once("end", resolve); });
+    request.once("error", resolve);
+    request.setTimeout(2000, () => { request.destroy(); resolve(); });
+    request.end();
+  });
+  if (server.exitCode === null) {
+    await new Promise((resolve) => {
+      const timeout = setTimeout(resolve, 10000);
+      server.once("exit", () => { clearTimeout(timeout); resolve(); });
+    });
+  }
+  if (server.exitCode === null) {
+    server.kill();
+    report.cleanupWarning = "Fixture did not exit gracefully; launcher termination was required";
+  }
+}
+
 async function apiJson(page, endpoint) {
   return page.evaluate(async ({ endpoint, token }) => {
     const response = await fetch(endpoint, { headers: { "X-Cockpit-Token": token } });
     return { status: response.status, body: await response.json() };
   }, { endpoint, token: sessionToken });
+}
+
+async function apiRequest(page, method, endpoint, body) {
+  const result = await page.evaluate(async ({ endpoint, method, body, token }) => {
+    const response = await fetch(endpoint, {
+      method,
+      headers: { "X-Cockpit-Token": token, "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return { status: response.status, body: await response.json() };
+  }, { endpoint, method, body, token: sessionToken });
+  assert.ok(result.status >= 200 && result.status < 300, `${method} ${endpoint}: ${JSON.stringify(result)}`);
+  return result.body;
+}
+
+async function waitForFinishedRun(page, previousId = null) {
+  await page.waitForFunction(async ({ previousId, token }) => {
+    const response = await fetch("/api/runs/current", { headers: { "X-Cockpit-Token": token } });
+    const { run } = await response.json();
+    return run && run.id !== previousId && ["complete", "degraded", "failed", "cancelled"].includes(run.status);
+  }, { previousId, token: sessionToken }, { timeout: 15000 });
+  return (await apiJson(page, "/api/runs/current")).body.run;
 }
 
 async function runCheck(name, action) {
@@ -409,9 +455,179 @@ async function main() {
       return "任务记录单列；便携设置默认关闭，显式勾选后可安全合并";
     });
 
+    const regression = {};
+    await runCheck("1.3 编辑其他主题字段保留已停用来源绑定", async () => {
+      regression.disabled = (await apiJson(page, "/api/sources")).body.sources.find((item) => item.name === sourceName);
+      regression.good = (await apiRequest(page, "POST", "/api/sources", {
+        name: `E2E 稳定来源 ${suffix}`, url: `https://fixture.invalid/good-${suffix}.xml`, enabled: true,
+      })).source;
+      regression.bad = (await apiRequest(page, "POST", "/api/sources", {
+        name: `E2E 异常来源 ${suffix}`, url: `https://fixture.invalid/bad-${suffix}.xml`, enabled: true,
+      })).source;
+      regression.topic = (await apiRequest(page, "POST", "/api/topics", {
+        name: `E2E 绑定回归 ${suffix}`, keywords: ["ESG"], threshold: 40, article_limit: 2,
+        source_ids: [regression.disabled.id],
+      })).topic;
+      await apiRequest(page, "PUT", "/api/settings", { scheduler_enabled: false, extract_full_text: false });
+      await page.reload({ waitUntil: "networkidle" });
+      await page.locator("#topic-sheet .topic-grid").filter({ hasText: regression.topic.name }).getByRole("button", { name: "编辑" }).click();
+      const sourceOption = page.locator(`#topic-source-options input[value="${regression.disabled.id}"]`);
+      assert.equal(await sourceOption.isChecked(), true);
+      assert.equal(await sourceOption.isDisabled(), false);
+      assert.match(await sourceOption.locator("..").textContent(), /已停用/);
+      regression.topic.name = `E2E 已改名 ${suffix}`;
+      await page.locator("#topic-name").fill(regression.topic.name);
+      await page.locator("#topic-form [type=submit]").click();
+      await page.locator("#topic-dialog").waitFor({ state: "hidden" });
+      const saved = (await apiJson(page, "/api/topics")).body.topics.find((item) => item.id === regression.topic.id);
+      assert.equal(saved.name, regression.topic.name);
+      assert.deepEqual(saved.source_ids, [regression.disabled.id]);
+      return "已停用的已选来源仍显示为勾选；仅修改名称后绑定不变";
+    });
+
+    await runCheck("1.3 移除最后绑定来源后保留范围，显式改选前不能运行", async () => {
+      const row = page.locator("#source-sheet .source-grid").filter({ hasText: regression.disabled.name });
+      await row.getByRole("button", { name: "移除" }).click();
+      await row.waitFor({ state: "detached" });
+      const before = (await apiJson(page, "/api/runs/current")).body.run;
+      const callsBefore = (await apiJson(page, "/api/e2e/state")).body.fetch_calls.length;
+      const topic = (await apiJson(page, "/api/topics")).body.topics.find((item) => item.id === regression.topic.id);
+      assert.deepEqual(topic.source_ids, [regression.disabled.id]);
+      await page.locator("#topic-rail-list").getByText(regression.topic.name, { exact: true }).click();
+      await page.locator("#start-run").click();
+      await page.locator("#topic-dialog").waitFor({ state: "visible" });
+      const archivedOption = page.locator(`#topic-source-options input[value="${regression.disabled.id}"]`);
+      assert.equal(await archivedOption.isChecked(), true);
+      assert.match(await archivedOption.locator("..").textContent(), /已移除.*保留绑定/);
+      assert.match(await page.locator("#toast-region").textContent(), /没有可用来源/);
+      assert.equal((await apiJson(page, "/api/runs/current")).body.run?.id || null, before?.id || null);
+      assert.equal((await apiJson(page, "/api/e2e/state")).body.fetch_calls.length, callsBefore);
+      await page.locator("#topic-excludes").fill("广告");
+      await page.locator("#topic-form [type=submit]").click();
+      await page.locator("#topic-dialog").waitFor({ state: "hidden" });
+      const preserved = (await apiJson(page, "/api/topics")).body.topics.find((item) => item.id === regression.topic.id);
+      assert.deepEqual(preserved.source_ids, [regression.disabled.id]);
+      await page.locator("#topic-sheet .topic-grid").filter({ hasText: regression.topic.name }).getByRole("button", { name: "编辑" }).click();
+      await page.locator(`#topic-source-options input[value="${regression.disabled.id}"]`).uncheck();
+      const confirmationPromise = page.waitForEvent("dialog");
+      const emptyScopeSave = page.locator("#topic-form [type=submit]").click();
+      const confirmation = await confirmationPromise;
+      assert.equal(confirmation.type(), "confirm");
+      assert.match(confirmation.message(), /全部.*来源/);
+      await confirmation.dismiss();
+      await emptyScopeSave;
+      assert.equal(await page.locator("#topic-dialog").evaluate((dialog) => dialog.open), true);
+      const afterCancelledScope = (await apiJson(page, "/api/topics")).body.topics.find((item) => item.id === regression.topic.id);
+      assert.deepEqual(afterCancelledScope.source_ids, [regression.disabled.id]);
+      await page.locator(`#topic-source-options input[value="${regression.good.id}"]`).check();
+      await page.locator(`#topic-source-options input[value="${regression.bad.id}"]`).check();
+      await page.locator("#topic-form [type=submit]").click();
+      await page.locator("#topic-dialog").waitFor({ state: "hidden" });
+      const explicit = (await apiJson(page, "/api/topics")).body.topics.find((item) => item.id === regression.topic.id);
+      assert.deepEqual(new Set(explicit.source_ids), new Set([regression.good.id, regression.bad.id]));
+      return "移除/无关编辑/取消全源确认均保留绑定；运行未发起，用户明确改选后范围才改变";
+    });
+
+    const configureFeed = (mode, title) => apiRequest(page, "POST", "/api/e2e/configure", {
+      mode, title, good_source_id: regression.good.id, bad_source_id: regression.bad.id,
+    });
+    await runCheck("1.3 部分来源失败时首页展示本次可用新文章", async () => {
+      regression.oldTitle = "E2E ESG 企业绿色投资增长10%";
+      regression.newTitle = "E2E ESG 企业绿色投资增长25%";
+      await configureFeed("success", regression.oldTitle);
+      await page.locator("#start-run").click();
+      regression.baselineRun = await waitForFinishedRun(page);
+      assert.equal(regression.baselineRun.status, "complete");
+      await page.locator("#latest-list").getByRole("link", { name: regression.oldTitle, exact: true }).waitFor({ timeout: 10000 });
+      await configureFeed("partial", regression.newTitle);
+      await page.locator("#start-run").click();
+      regression.partialRun = await waitForFinishedRun(page, regression.baselineRun.id);
+      assert.equal(regression.partialRun.status, "degraded");
+      assert.equal(regression.partialRun.article_count, 1);
+      await page.locator("#latest-list").getByRole("link", { name: regression.newTitle, exact: true }).waitFor({ timeout: 10000 });
+      assert.equal(await page.locator("#latest-list").getByRole("link", { name: regression.oldTitle, exact: true }).count(), 0);
+      assert.match(await page.locator("#report-context").textContent(), /本次部分完成.*已展示可用新结果/);
+      assert.equal((await apiJson(page, "/api/reports/latest")).body.report.run.id, regression.partialRun.id);
+      return "完整报告→部分完成：增长25%的新文立即替换旧10%报告并标注部分完成";
+    });
+
+    await runCheck("1.3 当前来源错误与健康随任务刷新，恢复后清除", async () => {
+      const badRow = page.locator("#source-sheet .source-grid").filter({ hasText: regression.bad.name });
+      const goodRow = page.locator("#source-sheet .source-grid").filter({ hasText: regression.good.name });
+      await page.waitForFunction(() => document.querySelector("#source-errors")?.textContent.includes("E2E_CURRENT_PARTIAL_SOURCE_ERROR"));
+      assert.match(await badRow.locator(".source-health").textContent(), /异常.*E2E_CURRENT_PARTIAL_SOURCE_ERROR/);
+      await configureFeed("all_failed", "");
+      await page.locator("#start-run").click();
+      const failed = await waitForFinishedRun(page, regression.partialRun.id);
+      assert.equal(failed.status, "failed");
+      await page.waitForFunction(() => document.querySelector("#source-errors")?.textContent.includes("本次 2 个来源"));
+      assert.match(await page.locator("#source-errors").textContent(), /E2E_CURRENT_ALL_FAILED_SOURCE_ERROR/);
+      assert.doesNotMatch(await page.locator("#source-errors").textContent(), /E2E_CURRENT_PARTIAL_SOURCE_ERROR/);
+      await page.waitForFunction((names) => names.every((name) => [...document.querySelectorAll("#source-sheet .source-grid")].some((row) => row.textContent.includes(name) && row.querySelector(".source-health")?.textContent.includes("E2E_CURRENT_ALL_FAILED_SOURCE_ERROR"))), [regression.good.name, regression.bad.name], { timeout: 7000 });
+      assert.match(await goodRow.locator(".source-health").textContent(), /异常/);
+      assert.match(await badRow.locator(".source-health").textContent(), /异常/);
+      assert.equal((await apiJson(page, "/api/reports/latest")).body.report.run.id, regression.partialRun.id);
+      regression.recoveryTitle = "E2E ESG 企业绿色投资增长40%";
+      await configureFeed("success", regression.recoveryTitle);
+      await page.locator("#start-run").click();
+      regression.recoveryRun = await waitForFinishedRun(page, failed.id);
+      assert.equal(regression.recoveryRun.status, "complete");
+      await page.locator("#latest-list").getByRole("link", { name: regression.recoveryTitle, exact: true }).waitFor({ timeout: 10000 });
+      await page.locator("#source-errors").waitFor({ state: "hidden" });
+      assert.equal((await badRow.locator(".source-health").textContent()).trim(), "正常");
+      assert.equal((await goodRow.locator(".source-health").textContent()).trim(), "正常");
+      return "1个源错误→2个当前错误→恢复清除；来源健康同步变化，旧报告不会遮蔽当前故障";
+    });
+
+    await runCheck("1.3 取消运行后立即保留有效报告并显示两个时间", async () => {
+      await configureFeed("slow", "");
+      await page.locator("#start-run").click();
+      await page.locator("#cancel-run").waitFor({ state: "visible" });
+      await page.waitForFunction(async (token) => {
+        const response = await fetch("/api/e2e/state", { headers: { "X-Cockpit-Token": token } });
+        return (await response.json()).fetch_calls.length > 0;
+      }, sessionToken);
+      await page.locator("#cancel-run").click();
+      await page.locator("#cancel-run").waitFor({ state: "hidden" });
+      const cancelled = (await apiJson(page, "/api/runs/current")).body.run;
+      assert.equal(cancelled.status, "cancelled");
+      assert.match(await page.locator("#report-context").textContent(), /本次新增 0 条.*当前为上次有效报告/);
+      assert.match(await page.locator("#report-context").textContent(), /本次任务：.+当前报告：/);
+      assert.match(await page.locator("#run-badge").textContent(), /已取消/);
+      assert.equal((await apiJson(page, "/api/reports/latest")).body.report.run.id, regression.recoveryRun.id);
+      await page.locator("#latest-list").getByRole("link", { name: regression.recoveryTitle, exact: true }).waitFor();
+      return "取消完成后无需刷新，旧报告、取消状态和本次/报告时间同时可见";
+    });
+
+    await runCheck("1.3 超过旧15秒超时的来源草稿及已保存验证均成功", async () => {
+      await page.locator("#add-source").click();
+      const slowName = `E2E 慢验证 ${suffix}`;
+      await page.locator("#source-name").fill(slowName);
+      await page.locator("#source-url").fill(`https://fixture.invalid/slow-validation-${suffix}.xml`);
+      const draftStart = Date.now();
+      await page.locator("#validate-source-draft").click();
+      await page.waitForFunction(() => document.querySelector("#source-validation")?.dataset.state === "success", null, { timeout: 25000 });
+      const draftElapsed = Date.now() - draftStart;
+      assert.ok(draftElapsed >= 15500, `Expected real 16s validation; got ${draftElapsed}ms`);
+      assert.match(await page.locator("#source-validation").textContent(), /读取成功/);
+      await page.locator("#source-form [type=submit]").click();
+      await page.locator("#source-dialog").waitFor({ state: "hidden" });
+      const slowRow = page.locator("#source-sheet .source-grid").filter({ hasText: slowName });
+      const savedStart = Date.now();
+      await slowRow.getByRole("button", { name: "验证", exact: true }).click();
+      await page.waitForFunction((name) => [...document.querySelectorAll("#source-sheet .source-grid")].some((row) => row.textContent.includes(name) && row.querySelector(".source-health")?.textContent.trim() === "正常"), slowName, { timeout: 25000 });
+      const savedElapsed = Date.now() - savedStart;
+      assert.ok(savedElapsed >= 15500, `Expected real 16s validation; got ${savedElapsed}ms`);
+      assert.doesNotMatch(await page.locator("#toast-region").textContent(), /超时/);
+      return `草稿验证${draftElapsed}ms、已保存验证${savedElapsed}ms均成功，未产生旧15秒误报`;
+    });
+
     await runCheck("浏览器流程无真实外网请求", async () => {
       assert.deepEqual(report.externalRequests, []);
-      return "所有请求仅访问 127.0.0.1";
+      assert.deepEqual(report.requestFailures, []);
+      assert.deepEqual(report.consoleErrors, []);
+      assert.deepEqual(report.pageErrors, []);
+      return "所有请求仅访问 127.0.0.1；HTTP、控制台和页面异常均为空";
     });
 
     await page.screenshot({ path: path.join(outputDir, "e2e-final.png"), fullPage: true });
@@ -422,16 +638,24 @@ async function main() {
     report.status = "failed";
     report.error = error.stack || error.message;
     report.serverOutput = serverOutput.join("").slice(-4000);
+    const failedPage = browser?.contexts()[0]?.pages()[0];
+    if (failedPage) {
+      await failedPage.screenshot({ path: path.join(outputDir, "e2e-failed.png"), fullPage: true }).catch(() => {});
+    }
     throw error;
   } finally {
     if (browser) await browser.close();
-    if (server && server.exitCode === null) server.kill();
+    await stopFixtureServer(baseUrl, server);
     if (process.env.KEEP_E2E_DATA !== "1") {
       const resolved = path.resolve(dataHome);
       const tempRoot = path.resolve(os.tmpdir());
       const basename = path.basename(resolved);
       if (path.dirname(resolved) === tempRoot && basename.startsWith("cookies-news-cockpit-e2e-")) {
-        fs.rmSync(resolved, { recursive: true, force: true });
+        try {
+          fs.rmSync(resolved, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+        } catch (error) {
+          report.cleanupWarning = `Isolated fixture directory retained: ${resolved}; ${error.message}`;
+        }
       }
     }
     fs.writeFileSync(path.join(outputDir, "report.json"), `${JSON.stringify(report, null, 2)}\n`, "utf8");

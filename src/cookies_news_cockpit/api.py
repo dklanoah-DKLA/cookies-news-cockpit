@@ -9,6 +9,7 @@ import secrets
 import sqlite3
 import tempfile
 import time
+import weakref
 import zipfile
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -27,6 +28,7 @@ from .backup import (
     BackupValidationError,
     read_backup,
 )
+from .instance import InstanceOwner
 from .keystore import DeepSeekKeyStore, KeyStoreError
 from .models import (
     CalibrationConfirm,
@@ -324,10 +326,18 @@ def create_app(
     feed_service: FeedService | None = None,
     deepseek_factory: Any | None = None,
     allowed_hosts: set[str] | None = None,
+    instance_owner: InstanceOwner | None = None,
 ) -> FastAPI:
     paths = paths or resolve_paths()
-    db = Database(paths.database)
-    db.recover_interrupted_runs()
+    owner = instance_owner or InstanceOwner(paths.root).acquire()
+    if not owner.held or owner.root != paths.root.resolve():
+        raise ValueError("Runtime ownership must match this app's data directory")
+    try:
+        db = Database(paths.database)
+        db.recover_interrupted_runs()
+    except BaseException:
+        owner.close()
+        raise
     # Enforce the 30-day full-text cache boundary even when the user only
     # reopens the app and does not start another successful refresh.
     try:
@@ -346,16 +356,41 @@ def create_app(
         deepseek_factory=deepseek_factory,
     )
     state = CockpitState(paths, db, manager, key_store, token)
+    state.instance_owner = owner
     hosts = allowed_hosts or {"127.0.0.1", "localhost", "[::1]"}
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        state.scheduler_task = asyncio.create_task(state.scheduler(), name="cockpit-scheduler")
-        yield
-        state.shutdown_event.set()
-        if state.scheduler_task:
-            state.scheduler_task.cancel()
-            await asyncio.gather(state.scheduler_task, return_exceptions=True)
+        try:
+            # Re-entering the same ASGI app is permitted only after reacquiring
+            # ownership; no scheduler or HTTP work may outlive its owner.
+            if not owner.held:
+                owner.acquire()
+                db.recover_interrupted_runs()
+            state.shutdown_event.clear()
+            state.scheduler_task = asyncio.create_task(state.scheduler(), name="cockpit-scheduler")
+            yield
+        finally:
+            state.shutdown_event.set()
+            if state.scheduler_task:
+                state.scheduler_task.cancel()
+                await asyncio.gather(state.scheduler_task, return_exceptions=True)
+            try:
+                # A process exit must finish cancellation before another
+                # process can recover or start work against this database.
+                running_tasks = tuple(state.manager.tasks.values())
+                await asyncio.gather(
+                    *(state.manager.cancel(run_id) for run_id in list(state.manager.tasks)),
+                    return_exceptions=True,
+                )
+                # Even a persistence failure inside cancel() must not leave
+                # network work alive after this process releases ownership.
+                for task in running_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*running_tasks, return_exceptions=True)
+            finally:
+                owner.close()
 
     app = FastAPI(
         title="Cookies News Cockpit",
@@ -366,6 +401,7 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.cockpit = state
+    weakref.finalize(app, owner.close)
 
     @app.middleware("http")
     async def local_session_guard(request: Request, call_next):
@@ -434,6 +470,7 @@ def create_app(
         {schema_version, run, source_errors, articles} report object.
         """
 
+        current = state.db.get_current_run()
         return {
             "product": {
                 "name": "Cookies News Cockpit",
@@ -446,7 +483,13 @@ def create_app(
             "deepseek": _deepseek_snapshot(state.db, state.key_store),
             "topics": state.db.list_topics(),
             "sources": state.db.list_sources(),
-            "current_run": state.db.get_current_run(),
+            "archived_sources": [
+                source for source in state.db.list_sources(include_archived=True)
+                if source["archived"]
+            ],
+            "source_scope_warning": state.db.source_scope_warning(),
+            "current_run": current,
+            "current_source_errors": state.manager.source_errors(current),
             "latest_report": state.manager.latest_report(),
         }
 
@@ -666,8 +709,8 @@ def create_app(
         return {"topic": topic, "calibration_id": value.calibration_id, "confirmed": True}
 
     @app.get("/api/sources")
-    async def list_sources() -> dict[str, Any]:
-        return {"sources": state.db.list_sources()}
+    async def list_sources(include_archived: bool = False) -> dict[str, Any]:
+        return {"sources": state.db.list_sources(include_archived=include_archived)}
 
     @app.post("/api/sources", status_code=201)
     async def create_source(value: SourceInput) -> dict[str, Any]:
@@ -712,7 +755,8 @@ def create_app(
 
     @app.get("/api/runs/current")
     async def current_run() -> dict[str, Any]:
-        return {"run": state.db.get_current_run()}
+        run = state.db.get_current_run()
+        return {"run": run, "source_errors": state.manager.source_errors(run)}
 
     @app.get("/api/runs/{run_id}")
     async def get_run(run_id: str) -> dict[str, Any]:
@@ -720,7 +764,7 @@ def create_app(
         articles = _articles_with_selection_tier(
             run, state.db.list_run_articles(run_id)
         )
-        return {"run": run, "articles": articles}
+        return {"run": run, "articles": articles, "source_errors": state.manager.source_errors(run)}
 
     @app.post("/api/runs/{run_id}/cancel")
     async def cancel_run(run_id: str) -> dict[str, Any]:
@@ -862,7 +906,7 @@ def create_app(
             run = state.db.get_run(run_id)
             try:
                 state.manager._write_artifact(run, [])
-                if previous_good is None:
+                if previous_good is None and not result.get("preserved_local_report", False):
                     state.db.set_latest_good_run(run_id)
             except Exception:
                 warning = "历史已安全导入，但无法生成首页报告；仍可在历史记录中查看。"

@@ -216,7 +216,9 @@ def test_source_restore_recovers_topic_bindings(storage_home: Path) -> None:
     topic = db.create_topic(TopicInput(name="Example topic", source_ids=[source["id"]]))
 
     db.delete_source(source["id"])
-    assert source["id"] not in db.get_topic(topic["id"])["source_ids"]
+    # Since 1.3 an unavailable ID keeps this an explicit (empty-effective)
+    # scope instead of making [] mean every enabled source.
+    assert source["id"] in db.get_topic(topic["id"])["source_ids"]
 
     restored = db.restore_source(source["id"])
     assert restored["archived"] is False

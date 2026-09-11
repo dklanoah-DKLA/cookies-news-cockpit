@@ -62,7 +62,7 @@ def test_source_draft_uses_distinct_homepage_feed_and_metadata_fields() -> None:
     assert '<option value="world">国际</option>' in html
     assert '<option value="science">科学</option>' in html
     assert '<option value="other">其他</option>' in html
-    assert 'querySelectorAll(\'input[type="checkbox"]:checked:not(:disabled)\')' in javascript
+    assert 'querySelectorAll(\'input[type="checkbox"]:checked\')' in javascript
     assert "（已停用）" in javascript
 
 

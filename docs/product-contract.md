@@ -1,4 +1,4 @@
-# Cookies News Cockpit — 1.2 product contract
+# Cookies News Cockpit — 1.3 product contract
 
 ## Product boundary
 
@@ -15,6 +15,11 @@ The first release targets one machine class:
 The application opens its cockpit in the user's default browser. Its service
 binds only to `127.0.0.1` and exits after the cockpit has been inactive for five
 minutes, unless a run is still finishing.
+
+A lifetime OS lock prevents a second backend from using the same data directory.
+It is acquired before startup recovery. On macOS, duplicate launch opens the
+existing session using an owner-private endpoint file; the API key is never in
+that file. Crashes release the OS lock without trusting PID files or timestamps.
 
 ## Core workflow
 
@@ -38,14 +43,15 @@ minutes, unless a run is still finishing.
    topic still lacks useful results, at most 20 newest, source-rotated
    candidates enter the initial semantic review and at most 15 more may enter
    one additional pass. This is a bounded supplement, not automatic threshold
-   reduction. Version 1.2 uses `deepseek-v4-flash` with thinking disabled. A
+   reduction. Version 1.3 uses `deepseek-v4-flash` with thinking disabled. A
    hard technical breaker still stops after 500 analyses in a single run.
 6. A report is split into core news and supplementary reading using the score
    and that topic's run-time `core_threshold` / `supplement_threshold` snapshot.
-   The latest successful report remains visible if a later run produces no new
-   items, fails, or is degraded. The UI labels a retained report and displays
-   both current-run time and effective-report time. Partial source failures do
-   not abort healthy sources.
+   A newer, durably saved degraded report with articles is visible with a clear
+   partial-result label; the last fully complete checkpoint is retained separately.
+   A run with no new items, all-source failure, or cancellation keeps the latest
+   usable report and displays both current-run and report time. Historical dedup
+   must never hide newly collected articles before they have a visible report.
 7. The user can search history, favorite articles, cancel a run, export a v2
    backup, preview an import, and apply a transactional safe merge. Portable
    settings restore is opt-in and limited to thresholds, counts, freshness,
@@ -62,12 +68,22 @@ minutes, unless a run is still finishing.
 - Full extracted article text and detailed logs: purged after 30 days
 - Reports, favorites, configuration, and canonical metadata: retained
 
-No telemetry is included in 1.2. Network calls are limited to user-enabled
+No telemetry is included in 1.3. Network calls are limited to user-enabled
 sources and DeepSeek.
 
 ## Failure semantics
 
-- A failed or degraded run never overwrites the last known-good report.
+- A failed or degraded run never overwrites the last fully complete checkpoint.
+  A committed degraded result with new articles is displayed, with failures disclosed.
+- Numeric/date/unit/stage signatures are compared before punctuation-insensitive
+  dedup branches, including exact normalized-title matches.
+- Disabled and archived source bindings survive unrelated topic edits. Removing
+  the last bound source does not mean selecting all sources. Local archives and
+  modified preset URLs take precedence during safe import and catalog sync.
+- Current-run errors are independent of the displayed report. Terminal transitions
+  and cancellation refresh source health, DeepSeek status and retained-report context.
+- Source validation has a 60-second frontend budget covering the backend's
+  45-second transfer plus up to five seconds of entry validation.
 - Duplicate review is on by default, runs before DeepSeek analysis, and records
   the number of suppressed candidates in the run metadata.
 - A finite freshness window excludes missing, invalid, or clearly future dates
@@ -93,7 +109,7 @@ sources and DeepSeek.
   confirmation.
 - The cloud-transfer scope and the 500-analysis safety breaker are disclosed
   before a key is saved. Actual cost remains the DeepSeek account holder's
-  responsibility; 1.2 does not claim to calculate or enforce a spending limit.
+  responsibility; 1.3 does not claim to calculate or enforce a spending limit.
 
 ## Local API contract
 
@@ -134,6 +150,16 @@ remapped IDs. ZIP input is capped at 100 MiB compressed and 100 MiB
 uncompressed; the DeepSeek key is never part of the archive. Apply accepts
 `import_portable_settings` and defaults it to `false`.
 
+Bootstrap additionally returns `archived_sources`, `source_scope_warning`, and
+`current_source_errors`. Run detail/current endpoints add `source_errors`, while
+preserving their existing fields. `GET /api/sources?include_archived=true` includes
+unavailable bindings for explicit editing; defaults still return live catalog rows.
+
+New imported runs are marked history-only in local metadata when a usable local
+report already exists. They remain searchable/exportable but cannot displace
+the local current task or report. Fresh-machine restoration is not suppressed;
+the local display-policy metadata itself is never exported.
+
 ## Catalog v2 source audit
 
 The following eight HTTPS feeds were fetched and parsed on 2026-09-10 with the
@@ -169,12 +195,18 @@ dates, and 60-day freshness without making test-suite network calls.
 ## Upgrade contract
 
 Replacing `Cookies News Cockpit.app` does not relocate or delete the data under
-`~/Library/Application Support/Cookies News Cockpit`. A 1.1 → 1.2 startup keeps
+`~/Library/Application Support/Cookies News Cockpit`. A 1.1/1.2 → 1.3 startup keeps
 existing topics, source edits and enablement, settings, history, favorites, and
 the Keychain-stored API key. Catalog v2 is merged idempotently; its eight new
 presets are disabled for existing users. Cross-machine backup import never
 transfers the Keychain key and restores portable settings only after the user
 ticks the preview checkbox.
+
+Before the first 1.3 mutation, an atomic `before-upgrade-1.3.0.sqlite3` snapshot
+is created and checked. Previous 1.2 snapshots and checkpoint metadata remain.
+Legacy pruned source scope is recovered from deletion snapshots; ambiguous
+empty scopes are restricted to unavailable bindings and request user review.
+Schema and backup version remain 2.
 
 ## Distribution contract
 
@@ -186,7 +218,7 @@ against a loopback smoke test, creates a DMG, emits SHA-256, and makes a ZIP
 whose root contains exactly that one DMG. Tagged builds publish permanent
 GitHub Release assets as well as the 30-day Actions artifact.
 
-Version 1.2 is not Developer ID signed or notarized. The recipient may need to use
+Version 1.3 is not Developer ID signed or notarized. The recipient may need to use
 System Settings → Privacy & Security → Open Anyway on first launch. A future
 Developer ID release can remove this friction without changing the data model.
 

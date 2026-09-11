@@ -157,9 +157,9 @@ async def test_live_analysis_missing_relevance_fields_fails_after_retry() -> Non
     assert client.last_request_count == 2
 
 
-def test_user_agent_reports_v12_local_personal_reader() -> None:
+def test_user_agent_reports_v13_local_personal_reader() -> None:
     assert USER_AGENT == (
-        "CookiesNewsCockpit/1.2 "
+        "CookiesNewsCockpit/1.3 "
         "(+https://github.com/dklanoah-DKLA/cookies-news-cockpit; local personal reader)"
     )
 

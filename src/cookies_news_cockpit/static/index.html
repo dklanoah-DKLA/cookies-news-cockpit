@@ -169,6 +169,7 @@
             <div class="funnel-breakdown" id="funnel-breakdown"></div>
           </div>
 
+          <div class="source-errors" id="source-scope-warning" role="status" hidden></div>
           <div class="source-errors" id="source-errors" role="status" hidden></div>
           <div class="story-list" id="latest-list" aria-live="polite"></div>
         </section>
@@ -338,7 +339,7 @@
           <label class="field"><span>入选分数</span><input id="topic-threshold" name="threshold" type="number" min="0" max="100" step="1" value="60" required><small>0–100，越高越严格。</small><span class="default-control"><input id="topic-threshold-default" type="checkbox" checked><span>使用全局默认</span></span></label>
           <label class="field"><span>新闻数量</span><input id="topic-limit" name="article_limit" type="number" min="1" max="100" step="1" value="20" required><small>每次最多保留的条数。</small><span class="default-control"><input id="topic-limit-default" type="checkbox" checked><span>使用全局默认</span></span></label>
         </div>
-        <fieldset class="field-group"><legend>使用来源</legend><div class="check-grid" id="topic-source-options"></div></fieldset>
+        <fieldset class="field-group"><legend>使用来源</legend><p class="helper-copy" id="topic-source-help">全不选 = 使用全部启用来源。若不想抓取，请关闭下方“启用主题”，不要仅清空来源。</p><div class="check-grid" id="topic-source-options" aria-describedby="topic-source-help"></div></fieldset>
         <label class="switch-row"><span><strong>启用主题</strong><small>关闭后保留设置，但不会参与抓取。</small></span><input id="topic-enabled" type="checkbox" checked><span class="switch-ui" aria-hidden="true"></span></label>
         <div class="suggestion-panel" id="topic-suggestion" hidden><div><strong>AI 关键词建议</strong><p id="topic-suggestion-copy">只提供建议，不会自动修改；确认后才加入草稿。</p></div><div class="chip-list" id="topic-suggestion-chips"></div><button class="button button--secondary" id="apply-topic-suggestion" type="button"><span class="button__label">确认加入草稿</span></button></div>
         <div class="modal__actions modal__actions--split"><button class="button button--secondary" id="suggest-topic" type="button"><span class="button__label">AI 扩展关键词</span></button><span class="modal__action-pair"><button class="button button--quiet" type="button" data-close-dialog><span class="button__label">取消</span></button><button class="button button--primary" type="submit"><span class="button__label">保存主题</span></button></span></div>

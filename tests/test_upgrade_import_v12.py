@@ -375,7 +375,7 @@ def test_first_v12_open_snapshots_v11_data_once_and_preserves_configuration(
     assert upgraded.get_latest_good_run_id() == V11_RUN_ID
 
     checkpoint = upgraded.get_metadata(UPGRADE_CHECKPOINT)
-    assert checkpoint["version"] == "1.2.0"
+    assert checkpoint["version"] == "1.3.0"
     assert checkpoint["snapshot"] == UPGRADE_SNAPSHOT_NAME
     with sqlite3.connect(snapshot) as connection:
         assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
@@ -411,7 +411,7 @@ def test_first_v12_open_snapshots_v11_data_once_and_preserves_configuration(
     assert restarted_twice.get_metadata(UPGRADE_CHECKPOINT) == checkpoint_before_restart
 
     assert hashlib.sha256(snapshot.read_bytes()).hexdigest() == first_hash
-    assert list((v12_home / "backups").glob("before-upgrade-1.2.0.sqlite3")) == [snapshot]
+    assert list((v12_home / "backups").glob("before-upgrade-1.3.0.sqlite3")) == [snapshot]
 
 
 def test_upgrade_checkpoint_failure_rolls_back_live_database_and_keeps_snapshot(
