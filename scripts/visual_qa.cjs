@@ -116,6 +116,24 @@ async function inspectViewport(browser, viewport) {
     };
   });
 
+  await page.locator("#source-category-filter").selectOption("banking_all");
+  await page.locator("#source-search").fill("香港");
+  await page.locator("#sources").scrollIntoViewIfNeeded();
+  await page.screenshot({ path: path.join(outputDir, `${viewport.name}-banking-sources.png`) });
+  measurements.bankingFilters = await page.evaluate(() => {
+    const selectors = ["#source-category-filter", "#source-search"];
+    const controls = selectors.map((selector) => {
+      const element = document.querySelector(selector);
+      const box = element.getBoundingClientRect();
+      return { id: element.id, labelled: Boolean(element.labels?.length), width: box.width, height: box.height };
+    });
+    return {
+      horizontalOverflow: document.documentElement.scrollWidth > document.documentElement.clientWidth,
+      controls,
+      results: document.querySelectorAll("#source-sheet .source-grid").length,
+    };
+  });
+
   await context.close();
   return { viewport, ...measurements, consoleErrors, pageErrors };
 }
@@ -142,6 +160,9 @@ async function main() {
         !result.heroFitsFold ||
         result.consoleErrors.length > 0 ||
         result.pageErrors.length > 0 ||
+        result.bankingFilters.horizontalOverflow ||
+        !result.bankingFilters.results ||
+        result.bankingFilters.controls.some((control) => !control.labelled || control.width < 44 || control.height < 44) ||
         !result.addressBarTokenRemoved,
     );
     if (failed) process.exitCode = 1;

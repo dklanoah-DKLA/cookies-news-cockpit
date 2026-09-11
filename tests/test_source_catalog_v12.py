@@ -18,7 +18,7 @@ FIXTURES = Path(__file__).parent / "fixtures" / "source_health"
 def test_catalog_v2_adds_eight_https_opt_in_rss_sources() -> None:
     selected = [preset for preset in SOURCE_PRESETS if preset.id in CATALOG_V2_SOURCE_IDS]
 
-    assert PRESET_CATALOG_VERSION == 2
+    assert PRESET_CATALOG_VERSION >= 2
     assert len(selected) == 8
     assert {preset.id for preset in selected} == set(CATALOG_V2_SOURCE_IDS)
     assert all(preset.url.startswith("https://") for preset in selected)

@@ -229,13 +229,20 @@
         <div class="section-heading section-heading--row">
           <div>
             <h2 id="sources-title">新闻来源</h2>
-            <p>首版使用 RSS 与 Atom；添加后可验证订阅地址。</p>
+            <p>使用 RSS 与 Atom；新增预设默认关闭，按需启用并绑定到主题。</p>
           </div>
           <button class="button button--secondary" id="add-source" type="button">
             <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>
             <span class="button__label">添加来源</span>
           </button>
         </div>
+        <div class="source-filters">
+          <label class="field"><span>来源分类</span><select id="source-category-filter"><option value="">全部分类</option></select></label>
+          <label class="field"><span>搜索来源</span><input id="source-search" type="search" placeholder="名称、网址或分类" autocomplete="off"></label>
+        </div>
+        <p class="helper-copy">筛选仅改变列表显示，不改变启用状态或抓取范围；具体范围由主题的来源绑定决定。</p>
+        <p class="helper-copy">公开订阅不等于允许转载；商用或转发内容前，请查看对应来源的使用条款。</p>
+        <p class="helper-copy" id="source-filter-count" role="status" aria-live="polite"></p>
         <div class="data-sheet" aria-label="新闻来源列表">
           <div class="data-sheet__head source-grid" aria-hidden="true">
             <span>来源</span><span>地址</span><span>类型</span><span>健康</span><span>操作</span>
@@ -357,8 +364,8 @@
         <label class="field"><span>网站首页</span><input id="source-homepage" type="url" placeholder="https://example.com/" spellcheck="false"><small>用于识别来源；抓取不会读取这个地址。</small></label>
         <label class="field"><span>RSS / Atom 订阅地址</span><input id="source-url" type="url" required placeholder="https://example.com/feed.xml" spellcheck="false"><small id="source-url-help">抓取实际使用这个地址，与网站首页分开填写。</small></label>
         <div class="form-grid form-grid--three">
-          <label class="field"><span>分类</span><select id="source-category"><option value="general">综合</option><option value="world">国际</option><option value="business">商业</option><option value="technology">科技</option><option value="science">科学</option><option value="policy">政策</option><option value="industry">行业</option><option value="custom">其他</option></select></label>
-          <label class="field"><span>语言</span><select id="source-language"><option value="zh">中文</option><option value="en">英文</option><option value="multi">多语言</option><option value="other">其他</option></select></label>
+          <label class="field"><span>分类</span><select id="source-category"><option value="general">综合</option><option value="world">国际</option><option value="business">商业</option><option value="central_bank">央行与货币政策</option><option value="bank_regulation">银行监管与合规</option><option value="banking">银行业动态</option><option value="fintech">支付与金融科技</option><option value="technology">科技</option><option value="science">科学</option><option value="policy">政策</option><option value="industry">行业</option><option value="custom">其他</option></select></label>
+          <label class="field"><span>语言</span><select id="source-language"><option value="zh">中文</option><option value="en">英文</option><option value="ja">日文</option><option value="multi">多语言</option><option value="other">其他</option></select></label>
           <label class="field"><span>来源属性</span><input id="source-preset" value="自定义" readonly></label>
         </div>
         <label class="field"><span>来源类型</span><input id="source-kind" value="RSS / Atom" readonly></label>

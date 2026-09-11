@@ -321,6 +321,57 @@ async function main() {
       return "来源保存后 UI 与 API 均为 disabled";
     });
 
+    await runCheck("银行来源分类与搜索只筛选显示，编辑保留分类且不误启用", async () => {
+      const before = (await apiJson(page, "/api/sources")).body.sources;
+      const topicsBefore = (await apiJson(page, "/api/topics")).body.topics;
+      const bankCategories = new Set(["central_bank", "bank_regulation", "banking", "fintech"]);
+      const bankSources = before.filter((source) => bankCategories.has(source.category));
+      assert.ok(bankSources.length >= 25);
+      await page.locator("#source-category-filter").selectOption("banking_all");
+      assert.equal(await page.locator("#source-sheet .source-grid").count(), bankSources.length);
+      const target = bankSources.find((source) => source.id === "preset-hkma-press-zh");
+      assert.ok(target);
+      await page.locator("#source-search").fill(target.name);
+      assert.equal(await page.locator("#source-sheet .source-grid").count(), 1);
+      const row = page.locator("#source-sheet .source-grid");
+      await row.getByRole("button", { name: "编辑", exact: true }).click();
+      assert.equal(await page.locator("#source-category").inputValue(), target.category);
+      await page.locator("#source-form [type=submit]").click();
+      await page.locator("#source-dialog").waitFor({ state: "hidden" });
+      assert.equal(await page.locator("#source-sheet .source-grid").count(), 1);
+      const after = (await apiJson(page, "/api/sources")).body.sources;
+      assert.deepEqual(after.map((source) => [source.id, source.enabled]), before.map((source) => [source.id, source.enabled]));
+      assert.equal(after.find((source) => source.id === target.id).category, target.category);
+      assert.deepEqual((await apiJson(page, "/api/topics")).body.topics, topicsBefore);
+      await page.locator("#source-search").fill("no-such-banking-source-xyz");
+      assert.equal(await page.locator("#source-sheet .source-grid").count(), 0);
+      assert.match(await page.locator("#source-sheet").textContent(), /没有符合筛选条件/);
+      await page.locator("#source-search").fill("");
+      await page.locator("#source-category-filter").selectOption("");
+      assert.equal(await page.locator("#source-sheet .source-grid").count(), before.length);
+      return `${bankSources.length} 个银行金融订阅可按分类和名称筛选，启用状态未改变`;
+    });
+
+    await runCheck("来源编辑保留导入的自定义分类与语言", async () => {
+      const custom = (await apiRequest(page, "POST", "/api/sources", {
+        name: `自定义银行来源 ${suffix}`, url: `https://fixture.invalid/custom-${suffix}.xml`,
+        category: "my-credit-research", language: "zh-Hant", enabled: false,
+      })).source;
+      await page.reload({ waitUntil: "networkidle" });
+      const row = page.locator("#source-sheet .source-grid").filter({ hasText: custom.name });
+      await row.getByRole("button", { name: "编辑", exact: true }).click();
+      assert.equal(await page.locator("#source-category").inputValue(), "my-credit-research");
+      assert.equal(await page.locator("#source-language").inputValue(), "zh-Hant");
+      await page.locator("#source-name").fill(`${custom.name} 已编辑`);
+      await page.locator("#source-form [type=submit]").click();
+      await page.locator("#source-dialog").waitFor({ state: "hidden" });
+      const saved = (await apiJson(page, "/api/sources")).body.sources.find((source) => source.id === custom.id);
+      assert.equal(saved.category, "my-credit-research");
+      assert.equal(saved.language, "zh-Hant");
+      assert.equal(saved.enabled, false);
+      return "仅改名称后 my-credit-research / zh-Hant 及停用状态均保留";
+    });
+
     await runCheck("Ctrl+K 打开并搜索驾驶舱", async () => {
       await page.keyboard.press("Control+K");
       assert.equal(await page.locator("#search-dialog").evaluate((dialog) => dialog.open), true);

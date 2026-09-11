@@ -91,7 +91,7 @@
       "funnel-semantic-initial", "funnel-semantic-additional", "funnel-semantic", "funnel-duplicates", "funnel-history-duplicates", "funnel-run-duplicates",
       "funnel-ai", "funnel-ai-success", "funnel-ai-failure", "funnel-core", "funnel-supplement", "funnel-below-supplement", "funnel-threshold", "funnel-budget", "funnel-kept", "cancel-run", "source-errors",
       "run-badge", "run-mode", "run-analysis-mode", "run-model", "run-cap", "run-dedupe", "run-retention",
-      "topic-sheet", "source-sheet", "deepseek-badge", "deepseek-action", "history-filter",
+      "topic-sheet", "source-sheet", "source-search", "source-category-filter", "source-filter-count", "deepseek-badge", "deepseek-action", "history-filter",
       "history-query", "history-topic", "history-favorite", "history-list", "history-load-more", "dock-status", "dock-note",
       "start-run", "source-scope-warning", "search-dialog", "command-query", "command-results", "topic-dialog", "topic-form",
       "topic-dialog-title", "topic-id", "topic-name", "topic-keywords", "topic-keyword-count", "topic-keyword-chips", "topic-excludes", "topic-exclude-count", "topic-exclude-chips",
@@ -1021,12 +1021,34 @@
 
   function renderSourceSheet() {
     refs.sourceSheet.replaceChildren();
+    const bankingCategories = new Set(["central_bank", "bank_regulation", "banking", "fintech"]);
+    const selectedCategory = refs.sourceCategoryFilter.value;
+    const categories = [...new Set(state.sources.map((source) => source.category || "general"))];
+    refs.sourceCategoryFilter.replaceChildren(
+      node("option", { value: "", text: "全部分类" }),
+      node("option", { value: "banking_all", text: "银行与金融 · 全部" }),
+      ...categories.map((category) => node("option", { value: category, text: sourceCategoryLabel(category) }))
+    );
+    refs.sourceCategoryFilter.value = selectedCategory === "banking_all" || categories.includes(selectedCategory) ? selectedCategory : "";
+    const category = refs.sourceCategoryFilter.value;
+    const query = refs.sourceSearch.value.trim().toLocaleLowerCase();
+    const visibleSources = state.sources.filter((source) => {
+      const key = source.category || "general";
+      const categoryMatches = !category || (category === "banking_all" ? bankingCategories.has(key) : key === category);
+      const searchable = `${source.name} ${source.url} ${sourceCategoryLabel(key)} ${source.language || ""}`.toLocaleLowerCase();
+      return categoryMatches && (!query || searchable.includes(query));
+    });
+    refs.sourceFilterCount.textContent = `显示 ${visibleSources.length} / ${state.sources.length} 个订阅 · 已启用 ${state.sources.filter((source) => source.enabled).length} 个`;
     if (!state.sources.length) {
       refs.sourceSheet.append(emptyState("还没有新闻来源", "添加一个 RSS 或 Atom 地址，驾驶舱才知道去哪里找新闻。", "添加来源", () => openSourceDialog()));
       return;
     }
+    if (!visibleSources.length) {
+      refs.sourceSheet.append(node("p", { className: "helper-copy", text: "没有符合筛选条件的来源，请调整分类或搜索词。" }));
+      return;
+    }
 
-    state.sources.forEach((source) => {
+    visibleSources.forEach((source) => {
       const toggle = node("button", {
         className: "mini-toggle",
         type: "button",
@@ -1048,7 +1070,7 @@
       const title = node("div", { className: "data-row__title" }, [toggle, titleCopy]);
       const url = node("div", { className: "data-row__url" }, [externalLink(source.url, source.url || "—")]);
       if (source.homepage) url.append(externalLink(source.homepage, "网站首页", "source-home-link"));
-      if (source.terms) url.append(externalLink(source.terms, "使用条款", "source-home-link"));
+      if (source.terms) url.append(externalLink(source.terms, "条款与声明", "source-home-link"));
       const type = node("div", {}, node("span", { className: "type-label", text: source.preset_id ? "预置 RSS" : "RSS / Atom" }));
       const health = sourceHealth(source);
       const badge = node("div", { className: "source-health" }, node("span", { className: "state-badge", text: health.label, "data-state": health.state }));
@@ -1069,7 +1091,7 @@
   }
 
   function sourceCategoryLabel(category) {
-    return ({ general: "综合", world: "国际", business: "商业", technology: "科技", science: "科学", policy: "政策", industry: "行业", custom: "其他" })[category] || category || "综合";
+    return ({ general: "综合", world: "国际", business: "商业", technology: "科技", science: "科学", policy: "政策", industry: "行业", climate: "气候", central_bank: "央行与货币政策", bank_regulation: "银行监管与合规", banking: "银行业动态", fintech: "支付与金融科技", custom: "其他" })[category] || category || "综合";
   }
 
   function rowAction(iconName, label, handler, danger = false) {
@@ -1384,8 +1406,15 @@
     refs.sourceName.value = source?.name || "";
     refs.sourceHomepage.value = source?.homepage || "";
     refs.sourceUrl.value = source?.url || "";
-    refs.sourceCategory.value = source?.category || "general";
-    refs.sourceLanguage.value = source?.language || "zh";
+    // Imported/custom values are valid API data, even when absent from this
+    // version's built-in choices. Preserve them when editing unrelated fields.
+    for (const [select, value] of [[refs.sourceCategory, source?.category || "general"], [refs.sourceLanguage, source?.language || "zh"]]) {
+      select.querySelectorAll("option[data-existing-value]").forEach((option) => option.remove());
+      if (![...select.options].some((option) => option.value === value)) {
+        select.append(node("option", { value, text: `保留原值：${value}`, "data-existing-value": "true" }));
+      }
+      select.value = value;
+    }
     refs.sourcePreset.value = source?.preset_id
       ? `内置 v${source.preset_version || 1}${source.user_modified ? " · 已调整" : ""}`
       : "自定义";
@@ -2062,7 +2091,6 @@
       current.enabled ||= Boolean(source.enabled);
       categories.set(key, current);
     });
-    const labels = { general: "综合", business: "商业", technology: "科技", policy: "政策", industry: "行业", science: "科学", climate: "气候", world: "国际" };
     refs.wizardSourceCategories.replaceChildren();
     if (!categories.size) {
       refs.wizardSourceCategories.append(node("p", { className: "helper-copy", text: "当前版本没有内置来源，可跳过并在驾驶舱中添加 RSS。" }));
@@ -2070,7 +2098,7 @@
     }
     categories.forEach((category) => {
       const input = node("input", { type: "checkbox", value: category.key, checked: category.enabled || category.key === "general" });
-      refs.wizardSourceCategories.append(node("label", { className: "check-option" }, [input, node("span", { text: `${labels[category.key] || category.key} · ${category.count} 个来源` })]));
+      refs.wizardSourceCategories.append(node("label", { className: "check-option" }, [input, node("span", { text: `${sourceCategoryLabel(category.key)} · ${category.count} 个来源` })]));
     });
   }
 
@@ -2211,6 +2239,8 @@
     refs.addTopicRail.addEventListener("click", () => openTopicDialog());
     refs.addTopic.addEventListener("click", () => openTopicDialog());
     refs.addSource.addEventListener("click", () => openSourceDialog());
+    refs.sourceSearch.addEventListener("input", renderSourceSheet);
+    refs.sourceCategoryFilter.addEventListener("change", renderSourceSheet);
     refs.openDeepseek.addEventListener("click", openDeepSeekDialog);
     refs.deepseekAction.addEventListener("click", openDeepSeekDialog);
     refs.exportReport.addEventListener("click", exportData);

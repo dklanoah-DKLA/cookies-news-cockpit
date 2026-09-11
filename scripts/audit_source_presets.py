@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 import feedparser
 import httpx
 
-from cookies_news_cockpit.presets import SOURCE_PRESETS_BY_URL, SourcePreset
+from cookies_news_cockpit.presets import BANKING_CATEGORIES, SOURCE_PRESETS_BY_URL, SourcePreset
 from cookies_news_cockpit.services import FEED_MAX_BYTES, USER_AGENT
 
 CATALOG_V2_SOURCE_IDS = (
@@ -192,12 +192,33 @@ def _catalog_v2_presets() -> list[SourcePreset]:
     return [by_id[source_id] for source_id in CATALOG_V2_SOURCE_IDS]
 
 
+def select_presets(source_ids: list[str], category: str | None = None) -> list[SourcePreset]:
+    """Select current catalog entries, rejecting typos instead of silently skipping."""
+    selected = list(SOURCE_PRESETS_BY_URL.values())
+    wanted = set(source_ids)
+    missing = wanted.difference(preset.id for preset in selected)
+    if missing:
+        raise ValueError(f"unknown source id(s): {', '.join(sorted(missing))}")
+    if wanted:
+        selected = [preset for preset in selected if preset.id in wanted]
+    if category:
+        categories = BANKING_CATEGORIES if category == "banking_all" else {category}
+        selected = [preset for preset in selected if preset.category in categories]
+    if not selected:
+        raise ValueError("no sources match the requested filters")
+    return selected
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Read-only health audit for Cookies News Cockpit catalog v2 feeds."
+        description="Read-only health audit for the current Cookies News Cockpit RSS catalog."
     )
     parser.add_argument("--timeout", type=float, default=45.0)
     parser.add_argument("--source-id", action="append", default=[])
+    parser.add_argument(
+        "--category", help="Exact category or banking_all for all banking categories"
+    )
+    parser.add_argument("--output", type=Path, help="Also save the audit JSON to this file")
     parser.add_argument("--fixture", type=Path)
     parser.add_argument("--fixture-url", default="https://fixture.example/feed.xml")
     args = parser.parse_args()
@@ -212,13 +233,10 @@ def main() -> int:
         )
         return 0
 
-    selected = _catalog_v2_presets()
-    if args.source_id:
-        wanted = set(args.source_id)
-        selected = [preset for preset in selected if preset.id in wanted]
-        missing = wanted.difference(preset.id for preset in selected)
-        if missing:
-            parser.error(f"unknown catalog v2 source id(s): {', '.join(sorted(missing))}")
+    try:
+        selected = select_presets(args.source_id, args.category)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     results: list[dict[str, Any]] = []
     link_cache: dict[str, dict[str, Any]] = {}
@@ -241,7 +259,11 @@ def main() -> int:
                 link_cache[url] = probe_browser_link(url, timeout=args.timeout)
             result[f"{label}_check"] = link_cache[url]
         results.append(result)
-    print(json.dumps(results, ensure_ascii=False, indent=2))
+    output = json.dumps(results, ensure_ascii=False, indent=2)
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(output + "\n", encoding="utf-8")
+    print(output)
     return 0 if all(result["ok"] for result in results) else 1
 
 

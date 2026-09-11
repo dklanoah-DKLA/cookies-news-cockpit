@@ -30,10 +30,13 @@ that file. Crashes release the OS lock without trusting PID files or timestamps.
    score threshold, an article limit, enabled sources, and a freshness window.
    Keyword separators are comma, Chinese comma, ideographic comma, semicolon,
    Chinese semicolon, CR, or LF; ordinary spaces remain part of a phrase.
-3. The built-in catalog contains 24 categorized Chinese and English RSS feeds.
-   Catalog v2 adds eight opt-in feeds; an existing installation receives them
+3. The built-in catalog contains 50 categorized Chinese and English RSS feeds.
+   Catalog v3 adds 26 opt-in banking/finance feeds; an existing installation receives them
    disabled and no user-modified preset is overwritten. A source stores its
    human homepage separately from its technical feed URL.
+   Categories and search only filter the visible list, never the enabled set or
+   topic bindings. The scoring engine remains sector-neutral, with no appliance
+   industry assumptions. Public RSS access is not a redistribution license.
 4. A manual run, or an hourly run while the cockpit is active, fetches and
    reviews duplicates before AI analysis. By default it compares the current
    candidates with the previous seven days across runs, sources, and topics.

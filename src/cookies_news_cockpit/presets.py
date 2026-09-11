@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-PRESET_CATALOG_VERSION = 2
+PRESET_CATALOG_VERSION = 3
+
+BANKING_CATEGORIES = frozenset({"central_bank", "bank_regulation", "banking", "fintech"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,8 +19,8 @@ class SourcePreset:
     default_enabled: bool = False
 
 
-# The catalog deliberately stays industry-neutral.  Feed URLs are the stable
-# merge key; display names and descriptive metadata may evolve in later packs.
+# The engine remains industry-neutral: these categories only help users choose
+# feeds. Stable preset IDs preserve user changes across catalog upgrades.
 SOURCE_PRESETS: tuple[SourcePreset, ...] = (
     SourcePreset(
         "preset-chinanews-scroll",
@@ -246,5 +248,244 @@ SOURCE_PRESETS: tuple[SourcePreset, ...] = (
     ),
 )
 
+
+# Catalog v3: public, publisher-operated banking and finance subscriptions.
+# Reviewed feed endpoints and discovery evidence: docs/source-catalog-v3.json.
+SOURCE_PRESETS += (
+    SourcePreset(
+        "preset-hkma-press-zh",
+        "香港金管局 · 新闻稿",
+        "https://www.hkma.gov.hk/chi/other-information/rss/rss_press-release.xml",
+        "https://www.hkma.gov.hk/chi/",
+        "central_bank",
+        "zh",
+        "https://www.hkma.gov.hk/chi/other-information/terms-and-conditions-of-use/",
+    ),
+    SourcePreset(
+        "preset-hkma-circulars-zh",
+        "香港金管局 · 银行通告",
+        "https://www.hkma.gov.hk/chi/other-information/rss/rss_circulars.xml",
+        "https://www.hkma.gov.hk/chi/",
+        "bank_regulation",
+        "zh",
+        "https://www.hkma.gov.hk/chi/other-information/terms-and-conditions-of-use/",
+    ),
+    SourcePreset(
+        "preset-hkma-insight-zh",
+        "香港金管局 · 汇思",
+        "https://www.hkma.gov.hk/chi/other-information/rss/rss_insight.xml",
+        "https://www.hkma.gov.hk/chi/",
+        "central_bank",
+        "zh",
+        "https://www.hkma.gov.hk/chi/other-information/terms-and-conditions-of-use/",
+    ),
+    SourcePreset(
+        "preset-hk-sfc-news-zh",
+        "香港证监会 · 新闻稿",
+        "https://www.sfc.hk/TC/RSS-Feeds/Press-releases",
+        "https://www.sfc.hk/TC/",
+        "bank_regulation",
+        "zh",
+        "https://www.sfc.hk/en/Quick-links/Others/Hyperlink-policy",
+    ),
+    SourcePreset(
+        "preset-hk-sfc-circulars-zh",
+        "香港证监会 · 通函",
+        "https://www.sfc.hk/TC/RSS-Feeds/Circulars",
+        "https://www.sfc.hk/TC/",
+        "bank_regulation",
+        "zh",
+        "https://www.sfc.hk/en/Quick-links/Others/Hyperlink-policy",
+    ),
+    SourcePreset(
+        "preset-boj-news-en",
+        "日本银行 · 最新发布",
+        "https://www.boj.or.jp/en/rss/whatsnew.xml",
+        "https://www.boj.or.jp/en/",
+        "central_bank",
+        "en",
+        "https://www.boj.or.jp/en/about/abouthp.htm",
+    ),
+    SourcePreset(
+        "preset-jfsa-news-en",
+        "日本金融厅 · 监管动态",
+        "https://www.fsa.go.jp/fsaEnNewsList_rss2.xml",
+        "https://www.fsa.go.jp/en/",
+        "bank_regulation",
+        "en",
+        "https://www.fsa.go.jp/en/rules/index.html",
+    ),
+    SourcePreset(
+        "preset-rba-media",
+        "澳大利亚储备银行 · 新闻发布",
+        "https://www.rba.gov.au/rss/rss-cb-media-releases.xml",
+        "https://www.rba.gov.au/",
+        "central_bank",
+        "en",
+        "https://www.rba.gov.au/copyright/",
+    ),
+    SourcePreset(
+        "preset-rba-speeches",
+        "澳大利亚储备银行 · 演讲",
+        "https://www.rba.gov.au/rss/rss-cb-speeches.xml",
+        "https://www.rba.gov.au/",
+        "central_bank",
+        "en",
+        "https://www.rba.gov.au/copyright/",
+    ),
+    SourcePreset(
+        "preset-hkgov-finance-zh",
+        "香港政府新闻网 · 财经",
+        "https://www.news.gov.hk/tc/categories/finance/html/articlelist.rss.xml",
+        "https://www.news.gov.hk/chi/",
+        "banking",
+        "zh",
+        "https://www.news.gov.hk/eng/about/",
+    ),
+    SourcePreset(
+        "preset-rthk-finance-zh",
+        "香港电台 · 财经新闻",
+        "https://rthk.hk/rthk/news/rss/c_expressnews_cfinance.xml",
+        "https://news.rthk.hk/rthk/ch/",
+        "banking",
+        "zh",
+        "https://www.rthk.hk/copyright/index.html",
+    ),
+    SourcePreset(
+        "preset-fintech-singapore",
+        "Fintech Singapore · 数字金融",
+        "https://fintechnews.sg/feed/",
+        "https://fintechnews.sg/",
+        "fintech",
+        "en",
+        "https://fintechnews.sg/privacy-policy/",
+    ),
+    SourcePreset(
+        "preset-fed-bank-regulation",
+        "美联储 · 银行与消费者监管",
+        "https://www.federalreserve.gov/feeds/press_bcreg.xml",
+        "https://www.federalreserve.gov/supervisionreg.htm",
+        "bank_regulation",
+        "en",
+        "https://www.federalreserve.gov/website-linking-policies.htm",
+    ),
+    SourcePreset(
+        "preset-fed-enforcement",
+        "美联储 · 执法行动",
+        "https://www.federalreserve.gov/feeds/press_enforcement.xml",
+        "https://www.federalreserve.gov/supervisionreg.htm",
+        "bank_regulation",
+        "en",
+        "https://www.federalreserve.gov/website-linking-policies.htm",
+    ),
+    SourcePreset(
+        "preset-fed-monetary-policy",
+        "美联储 · 货币政策",
+        "https://www.federalreserve.gov/feeds/press_monetary.xml",
+        "https://www.federalreserve.gov/monetarypolicy.htm",
+        "central_bank",
+        "en",
+        "https://www.federalreserve.gov/website-linking-policies.htm",
+    ),
+    SourcePreset(
+        "preset-fed-supervision-letters",
+        "美联储 · 监管函与手册",
+        "https://www.federalreserve.gov/feeds/bankinginfo-rss.xml",
+        "https://www.federalreserve.gov/supervisionreg.htm",
+        "bank_regulation",
+        "en",
+        "https://www.federalreserve.gov/website-linking-policies.htm",
+    ),
+    SourcePreset(
+        "preset-ecb-news",
+        "欧洲央行 · 新闻与讲话",
+        "https://www.ecb.europa.eu/rss/press.html",
+        "https://www.ecb.europa.eu/",
+        "central_bank",
+        "en",
+        "https://www.ecb.europa.eu/services/using-our-site/disclaimer/html/index.en.html",
+    ),
+    SourcePreset(
+        "preset-ecb-bank-supervision",
+        "欧洲央行 · 银行监管",
+        "https://www.bankingsupervision.europa.eu/rss/press.html",
+        "https://www.bankingsupervision.europa.eu/",
+        "bank_regulation",
+        "en",
+        "https://www.bankingsupervision.europa.eu/services/disclaimer/html/index.en.html",
+    ),
+    SourcePreset(
+        "preset-boe-news",
+        "英格兰银行 · 新闻",
+        "https://www.bankofengland.co.uk/rss/news",
+        "https://www.bankofengland.co.uk/",
+        "central_bank",
+        "en",
+        "https://www.bankofengland.co.uk/legal",
+    ),
+    SourcePreset(
+        "preset-boe-prudential",
+        "英格兰银行 · 审慎监管",
+        "https://www.bankofengland.co.uk/rss/prudential-regulation-publications",
+        "https://www.bankofengland.co.uk/prudential-regulation",
+        "bank_regulation",
+        "en",
+        "https://www.bankofengland.co.uk/legal",
+    ),
+    SourcePreset(
+        "preset-cfpb-newsroom",
+        "美国CFPB · 消费金融保护",
+        "https://www.consumerfinance.gov/about-us/newsroom/feed/",
+        "https://www.consumerfinance.gov/about-us/newsroom/",
+        "bank_regulation",
+        "en",
+        "https://www.consumerfinance.gov/privacy/website-privacy-policy/",
+    ),
+    SourcePreset(
+        "preset-bis-research",
+        "BIS · 金融与监管研究",
+        "https://www.bis.org/doclist/bis_fsi_publs.rss",
+        "https://www.bis.org/",
+        "banking",
+        "en",
+        "https://www.bis.org/about/terms-conditions",
+    ),
+    SourcePreset(
+        "preset-bis-central-bank-speeches",
+        "BIS · 全球央行讲话",
+        "https://www.bis.org/doclist/cbspeeches.rss",
+        "https://www.bis.org/",
+        "central_bank",
+        "en",
+        "https://www.bis.org/about/terms-conditions",
+    ),
+    SourcePreset(
+        "preset-eba-news",
+        "欧洲银行管理局 · 新闻",
+        "https://www.eba.europa.eu/news-press/news/rss.xml",
+        "https://www.eba.europa.eu/publications-and-media/press-releases",
+        "bank_regulation",
+        "en",
+        "https://www.eba.europa.eu/find-out-about-us/legal-notice",
+    ),
+    SourcePreset(
+        "preset-boc-press-releases",
+        "加拿大央行 · 新闻稿",
+        "https://www.bankofcanada.ca/content_type/press-releases/feed/",
+        "https://www.bankofcanada.ca/",
+        "central_bank",
+        "en",
+        "https://www.bankofcanada.ca/terms/",
+    ),
+    SourcePreset(
+        "preset-boc-market-notices",
+        "加拿大央行 · 市场通知",
+        "https://www.bankofcanada.ca/content_type/notices/feed/",
+        "https://www.bankofcanada.ca/",
+        "central_bank",
+        "en",
+        "https://www.bankofcanada.ca/terms/",
+    ),
+)
 
 SOURCE_PRESETS_BY_URL = {preset.url: preset for preset in SOURCE_PRESETS}
